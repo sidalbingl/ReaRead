@@ -94,7 +94,7 @@ The plan ensures incremental feature delivery, each phase adding a functional la
   ```js
   { foreign: ["translate","simplify"], technical: ["summarize","explain"], reading_difficulty: ["simplify","tts"] }
   ```  
-- [ ] Integrate **Groq API** (primary) and **Ollama (Mistral)** as fallback.  
+- [ ] Integrate **Groq API** (primary)  
 - [ ] Define LLM prompts for each task type.  
 - [ ] Parse LLM output and send it back to content script.
 
@@ -145,7 +145,7 @@ The plan ensures incremental feature delivery, each phase adding a functional la
 | Feature | Description | Tech Stack |
 |----------|--------------|------------|
 | Voice Command Mode | Trigger “Explain” or “Read aloud” via voice | Web SpeechRecognition API |
-| Offline AI | Run on-device LLM (Phi-3-mini or TinyLlama) | Ollama local inference |
+| Offline AI | Run on-device LLM (Phi-3-mini or TinyLlama) |
 | Reading Analytics Dashboard | Visualize attention heatmaps, reading time | Chart.js + IndexedDB |
 | Multi-language Support | English, Turkish, German NLP tuning | HuggingFace multilingual SBERT |
 

@@ -11,7 +11,7 @@ All critical processing (eye tracking, fusion model inference, DOM actions) runs
 
 **Key traits**
 - Manifest V3 compliant (Chrome, Edge; Firefox MV3 port-ready).
-- Zero backend requirement for MVP (LLM via public API or local Ollama).
+- Zero backend requirement for MVP (LLM via public API).
 - Modular layers so each capability can evolve independently.
 
 ---
@@ -47,7 +47,7 @@ All critical processing (eye tracking, fusion model inference, DOM actions) runs
                          v
                +----------------------+
                |    LLM Action Layer  |
-               | (Groq/Ollama/OpenAI) |
+               | (Groq/OpenAI) |
                +----------------------+
                          |
                          v
@@ -75,7 +75,7 @@ All critical processing (eye tracking, fusion model inference, DOM actions) runs
 | 4 | Semantic Analyzer → Fusion AI | `{sentenceId, complexity}` | Precomputed per sentence. |
 | 5 | Fusion AI → Decision Layer | `{difficulty, confidence, sentenceId}` | TF.js model predicts flag. |
 | 6 | Decision Layer → LLM Layer | `{action, text}` | Chooses simplify/summarize/explain/translate/TTS. |
-| 7 | LLM Layer → Accessibility Engine | `{outputText, meta}` | API or local model response. |
+| 7 | LLM Layer → Accessibility Engine | `{outputText, meta}` | API model response. |
 | 8 | Accessibility Engine → User | Tooltip/Highlight/TTS/Zoom | Non‑intrusive UI inside page. |
 | 9 | Accessibility Engine → IndexedDB | Minimal logs/preferences | No PII; aggregate metrics only. |
 
@@ -148,7 +148,7 @@ const ACTIONS = {
 Confidence threshold (e.g. `>0.7`) gates LLM usage to save tokens.
 
 ### 4.6 LLM Action Layer
-- **Providers:** Groq (primary, fast), Ollama (local Mistral/Phi‑3), OpenAI GPT‑4o‑mini (optional).
+- **Providers:** Groq (primary, fast), OpenAI GPT‑4o‑mini (optional).
 - **Prompts:**
   - Simplify: “Rewrite this concisely and clearly for general readers.”
   - Summarize: “Summarize in one sentence; keep key result.”
@@ -210,7 +210,7 @@ Schema sketch:
 ---
 
 ## 8. Error Handling & Resilience
-- Provider fallback: Groq → Ollama → OpenAI (configurable).  
+- Provider fallback: Groq →  OpenAI (configurable).  
 - Timeouts & retries with exponential backoff for API calls.  
 - Circuit breaker: disable LLM temporarily if error rate spikes.  
 - Safe UI: tooltip never blocks native page interactions (esc to close).
@@ -302,7 +302,7 @@ rea-read-extension/
 
 ## 13. Risks & Mitigations
 - **Eye tracking noise** → smooth/median filters; lower FPS; calibration step.  
-- **Token costs/latency** → confidence gating + caching; local Ollama fallback.  
+- **Token costs/latency** → confidence gating + caching.  
 - **DOM variability** → robust sentence mapping; use Ranges; observe mutations.  
 - **Permission friction** → clear, minimal prompts; per‑site opt‑in.
 

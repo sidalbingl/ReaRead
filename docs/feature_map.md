@@ -83,7 +83,7 @@ It also clarifies which actions are part of the **base MVP** and which are **opt
 
 | Feature | Depends On | Description |
 |----------|-------------|-------------|
-| Simplify / Summarize | LLM API | Requires stable Groq or Ollama integration |
+| Simplify / Summarize | LLM API | Requires stable Groq integration |
 | Translate | Language detection | Requires `langdetect` JS module |
 | Explain | Sentence-BERT | Needs semantic embeddings |
 | TTS | Web Speech API | Browser native |

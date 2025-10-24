@@ -51,7 +51,7 @@ ReaRead introduces **intelligent, context-aware support** — it *detects* the d
 | **Semantic Analyzer** | Readability & complexity scoring | Determines which sentences are difficult | `Sentence-BERT (HuggingFace)`, `textstat` |
 | **Fusion AI Model** | Difficulty classifier | Merges gaze + semantic data to predict struggle | `TensorFlow.js`, `Lightweight LSTM` |
 | **Decision Layer (Auto Mode)** | Context-aware mode detection | Auto-detects user type (dyslexia / foreign / technical) | `Custom JS logic + semantic heuristics` |
-| **LLM Action Layer** | Simplify / Summarize / Translate / Explain | Calls appropriate language model | `Groq API`, `Ollama (Mistral 7B)`, `OpenAI GPT-4o-mini` |
+| **LLM Action Layer** | Simplify / Summarize / Translate / Explain | Calls appropriate language model | `Groq API`,  `OpenAI GPT-4o-mini` |
 | **Accessibility Engine** | Apply real-time DOM actions | Popup summaries, zoom, highlight, or TTS | `Web Speech API`, `CSS DOM manipulation` |
 | **Data Layer** | Local user profile + preferences | Saves usage patterns (no personal data) | `IndexedDB`, `Firebase Sync (optional)` |
 | **UI Layer** | Minimal React popup | Start/stop tracking, quick settings | `React.js + Manifest V3` |
@@ -102,7 +102,7 @@ User Feedback + IndexedDB Logs
 | **Computer Vision** | MediaPipe Iris + TensorFlow.js | Google-backed, efficient on browser |
 | **NLP / Embedding** | Sentence-BERT (HuggingFace) | Lightweight semantic understanding |
 | **ML Fusion Model** | TensorFlow.js (client-side LSTM) | Runs locally without backend |
-| **LLM Integration** | Groq API (fast inference), Ollama (local), OpenAI GPT-4o-mini | Multi-provider flexibility |
+| **LLM Integration** | Groq API (fast inference),  OpenAI GPT-4o-mini | Multi-provider flexibility |
 | **TTS & Speech** | Web Speech API, gTTS (fallback) | Cross-browser support |
 | **Data Storage** | IndexedDB (local), Firebase (optional sync) | Privacy-first local persistence |
 | **Deployment** | Chrome Web Store, Edge Add-ons | Easy cross-browser distribution |
@@ -159,7 +159,7 @@ User Feedback + IndexedDB Logs
 ## 13. Deliverables  
 - Full browser extension (React + MV3)  
 - Trained lightweight Fusion AI model (TensorFlow.js)  
-- Functional LLM pipeline (Groq / Ollama)  
+- Functional LLM pipeline (Groq )  
 - Demo video & technical presentation  
 - Documentation (`architecture.md`, `prd.md`, `feature_map.md`)  
 

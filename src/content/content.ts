@@ -1,349 +1,162 @@
 // Content script for ReaRead extension
-// Handles eye tracking, text analysis, and UI updates on web pages
 
-// State
-interface GazeData {
-  x: number;
-  y: number;
-  timestamp: number;
-  fixations: Array<{
-    x: number;
-    y: number;
-    startTime: number;
-    duration: number;
-  }>;
+let stream: MediaStream | null = null;
+let overlayRoot: HTMLDivElement | null = null;
+let statusBadge: HTMLDivElement | null = null;
+let videoEl: HTMLVideoElement | null = null;
+let isActive = false;
+
+function ensureOverlay() {
+  if (!overlayRoot) {
+    overlayRoot = document.createElement("div");
+    overlayRoot.id = "rearead-overlay";
+    overlayRoot.style.position = "fixed";
+    overlayRoot.style.top = "10px";
+    overlayRoot.style.right = "10px";
+    overlayRoot.style.zIndex = "999999";
+    overlayRoot.style.pointerEvents = "none";
+    overlayRoot.style.display = "flex";
+    overlayRoot.style.flexDirection = "column";
+    overlayRoot.style.gap = "8px";
+    document.documentElement.appendChild(overlayRoot);
+  }
+  
+  if (!statusBadge) {
+    statusBadge = document.createElement("div");
+    statusBadge.style.fontFamily = "system-ui, sans-serif";
+    statusBadge.style.fontSize = "12px";
+    statusBadge.style.color = "#fff";
+    statusBadge.style.padding = "6px 10px";
+    statusBadge.style.borderRadius = "999px";
+    statusBadge.style.boxShadow = "0 2px 8px rgba(0,0,0,.2)";
+    statusBadge.style.fontWeight = "500";
+    overlayRoot.appendChild(statusBadge);
+  }
+  
+  if (!videoEl) {
+    videoEl = document.createElement("video");
+    videoEl.autoplay = true;
+    videoEl.muted = true;
+    videoEl.playsInline = true;
+    videoEl.style.width = "160px";
+    videoEl.style.height = "120px";
+    videoEl.style.objectFit = "cover";
+    videoEl.style.borderRadius = "12px";
+    videoEl.style.boxShadow = "0 6px 18px rgba(0,0,0,.25)";
+    videoEl.style.pointerEvents = "none";
+    overlayRoot.appendChild(videoEl);
+  }
 }
 
-interface TextElement {
-  element: HTMLElement;
-  text: string;
-  rect: DOMRect;
-  complexity: number;
-  id: string;
-}
+async function startCamera() {
+  if (isActive) return;
+  try {
+    ensureOverlay();
+    console.log("[ReaRead] Requesting camera access...");
 
-class ReaReadContent {
-  private isActive: boolean = false;
-  private gazeData: GazeData = { x: 0, y: 0, timestamp: 0, fixations: [] };
-  private textElements: TextElement[] = [];
-  private settings = {
-    showGazeCursor: true,
-    showFixations: true,
-    highlightDifficultText: true,
-  };
-  private gazeCursor: HTMLElement | null = null;
-  private lastProcessedTime: number = 0;
-  private processingInterval: number = 100; // ms
+    const constraints = { video: { facingMode: "user" } };
+    const streamTemp = await navigator.mediaDevices.getUserMedia(constraints);
+    console.log("[ReaRead] getUserMedia() returned:", streamTemp);
 
-  constructor() {
-    this.initialize();
-  }
-
-  private initialize() {
-    // Create UI elements
-    this.createGazeCursor();
-    
-    // Listen for messages from background script
-    chrome.runtime.onMessage.addListener(this.handleMessage.bind(this));
-    
-    // Set up mutation observer to detect DOM changes
-    this.setupMutationObserver();
-    
-    console.log('ReaRead content script initialized');
-  }
-
-  private createGazeCursor() {
-    if (this.gazeCursor) return;
-    
-    this.gazeCursor = document.createElement('div');
-    this.gazeCursor.style.position = 'fixed';
-    this.gazeCursor.style.width = '20px';
-    this.gazeCursor.style.height = '20px';
-    this.gazeCursor.style.borderRadius = '50%';
-    this.gazeCursor.style.background = 'rgba(79, 70, 229, 0.5)';
-    this.gazeCursor.style.pointerEvents = 'none';
-    this.gazeCursor.style.transform = 'translate(-50%, -50%)';
-    this.gazeCursor.style.zIndex = '999999';
-    this.gazeCursor.style.transition = 'transform 0.1s ease-out';
-    this.gazeCursor.style.display = 'none';
-    
-    document.body.appendChild(this.gazeCursor);
-  }
-
-  private setupMutationObserver() {
-    const observer = new MutationObserver((mutations) => {
-      if (this.isActive) {
-        this.analyzePageText();
-      }
-    });
-
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
-  }
-
-  private async analyzePageText() {
-    // Extract all text nodes from the page
-    const walker = document.createTreeWalker(
-      document.body,
-      NodeFilter.SHOW_TEXT,
-      { acceptNode: () => NodeFilter.FILTER_ACCEPT }
-    );
-
-    const textNodes: Node[] = [];
-    let node: Node | null;
-    
-    while ((node = walker.nextNode())) {
-      if (node.nodeValue && node.nodeValue.trim().length > 0) {
-        textNodes.push(node);
-      }
+    if (!streamTemp) {
+      console.error("[ReaRead] getUserMedia returned null/undefined!");
+      return;
     }
 
-    // Group text nodes by their parent elements
-    const elementMap = new Map<HTMLElement, string[]>();
-    
-    for (const node of textNodes) {
-      if (!node.parentElement) continue;
-      
-      const text = node.nodeValue?.trim() || '';
-      if (text.length === 0) continue;
-      
-      const parent = this.findSuitableParent(node.parentElement);
-      
-      if (elementMap.has(parent)) {
-        elementMap.get(parent)?.push(text);
+    stream = streamTemp;
+    isActive = true;
+
+    // DOM’a eklendiğinden emin ol
+    requestAnimationFrame(async () => {
+      const videoEl = document.querySelector('video');
+      if (videoEl) {
+        videoEl.srcObject = stream;
+        try {
+          await videoEl.play();
+          console.log("[ReaRead] Video element play triggered, state:", videoEl.readyState);
+        } catch (err) {
+          console.error("[ReaRead] video.play() error:", err);
+        }
       } else {
-        elementMap.set(parent, [text]);
+        console.warn("[ReaRead] Video element not found in DOM.");
       }
-    }
-
-    // Process each text element
-    this.textElements = [];
-    
-    for (const [element, texts] of elementMap.entries()) {
-      const combinedText = texts.join(' ');
-      const rect = element.getBoundingClientRect();
-      
-      // Skip elements that are not visible or too small
-      if (rect.width < 10 || rect.height < 10 || this.isElementHidden(element)) {
-        continue;
-      }
-      
-      // Calculate text complexity (simplified for now)
-      const complexity = this.calculateTextComplexity(combinedText);
-      
-      this.textElements.push({
-        element,
-        text: combinedText,
-        rect,
-        complexity,
-        id: `rearead-text-${this.textElements.length}`,
-      });
-    }
-    
-    console.log(`Analyzed ${this.textElements.length} text elements`);
-  }
-
-  private findSuitableParent(element: HTMLElement): HTMLElement {
-    // Find the nearest block-level element
-    const blockElements = [
-      'P', 'DIV', 'ARTICLE', 'SECTION', 'MAIN', 'ASIDE', 'HEADER', 'FOOTER',
-      'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'BLOCKQUOTE', 'FIGURE', 'FIGCAPTION'
-    ];
-    
-    let current: HTMLElement | null = element;
-    
-    while (current && !blockElements.includes(current.tagName)) {
-      if (!current.parentElement) break;
-      current = current.parentElement;
-    }
-    
-    return current || element;
-  }
-
-  private isElementHidden(element: HTMLElement): boolean {
-    if (element.hidden || !element.offsetParent) return true;
-    
-    const style = window.getComputedStyle(element);
-    return (
-      style.display === 'none' ||
-      style.visibility === 'hidden' ||
-      style.opacity === '0' ||
-      element.getAttribute('aria-hidden') === 'true'
-    );
-  }
-
-  private calculateTextComplexity(text: string): number {
-    // Simple complexity calculation based on word length and special characters
-    const words = text.split(/\s+/).filter(word => word.length > 0);
-    if (words.length === 0) return 0;
-    
-    const avgWordLength = words.reduce((sum, word) => sum + word.length, 0) / words.length;
-    const specialChars = text.replace(/[\w\s]/g, '').length;
-    const specialCharRatio = specialChars / Math.max(1, text.length);
-    
-    // Normalize to 0-1 range
-    return Math.min(1, (avgWordLength / 10) * 0.6 + specialCharRatio * 0.4);
-  }
-
-  private updateGazeCursor(x: number, y: number) {
-    if (!this.gazeCursor || !this.settings.showGazeCursor) return;
-    
-    this.gazeCursor.style.display = 'block';
-    this.gazeCursor.style.left = `${x}px`;
-    this.gazeCursor.style.top = `${y}px`;
-    
-    // Update fixation data
-    const now = Date.now();
-    const lastFixation = this.gazeData.fixations[this.gazeData.fixations.length - 1];
-    
-    if (lastFixation && this.isNearby(x, y, lastFixation.x, lastFixation.y, 20)) {
-      // Update existing fixation
-      lastFixation.duration = now - lastFixation.startTime;
-    } else {
-      // Add new fixation
-      this.gazeData.fixations.push({
-        x,
-        y,
-        startTime: now,
-        duration: 0,
-      });
-      
-      // Keep only recent fixations
-      if (this.gazeData.fixations.length > 100) {
-        this.gazeData.fixations.shift();
-      }
-    }
-    
-    // Update gaze data
-    this.gazeData = {
-      ...this.gazeData,
-      x,
-      y,
-      timestamp: now,
-    };
-    
-    // Process gaze data at a controlled rate
-    if (now - this.lastProcessedTime > this.processingInterval) {
-      this.processGazeData();
-      this.lastProcessedTime = now;
-    }
-  }
-
-  private isNearby(x1: number, y1: number, x2: number, y2: number, threshold: number): boolean {
-    const dx = x1 - x2;
-    const dy = y1 - y2;
-    return Math.sqrt(dx * dx + dy * dy) <= threshold;
-  }
-
-  private processGazeData() {
-    if (!this.isActive) return;
-    
-    // Send gaze data to background script
-    chrome.runtime.sendMessage({
-      type: 'GAZE_DATA',
-      data: this.gazeData,
     });
-    
-    // Check for text under gaze
-    const element = document.elementFromPoint(
-      this.gazeData.x + window.scrollX,
-      this.gazeData.y + window.scrollY
-    ) as HTMLElement;
-    
-    if (element) {
-      // Find the nearest text element
-      const textElement = this.findNearestTextElement(element);
-      
-      if (textElement) {
-        // Highlight the text being looked at
-        this.highlightText(textElement);
-      }
-    }
-  }
 
-  private findNearestTextElement(element: HTMLElement): TextElement | null {
-    let current: HTMLElement | null = element;
-    
-    while (current) {
-      const textEl = this.textElements.find(el => el.element === current);
-      if (textEl) return textEl;
-      
-      if (!current.parentElement) break;
-      current = current.parentElement;
-    }
-    
-    return null;
-  }
-
-  private highlightText(textElement: TextElement) {
-    // Simple highlight effect
-    const highlightClass = 'rearead-highlight';
-    
-    // Remove previous highlights
-    document.querySelectorAll(`.${highlightClass}`).forEach(el => {
-      el.classList.remove(highlightClass);
-    });
-    
-    // Add highlight to current element
-    textElement.element.classList.add(highlightClass);
-    
-    // Scroll the element into view if needed
-    textElement.element.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }
-
-  private handleMessage(message: any, sender: any, sendResponse: (response?: any) => void) {
-    switch (message.type) {
-      case 'START_TRACKING':
-        this.isActive = true;
-        this.gazeCursor?.style.setProperty('display', 'block');
-        this.analyzePageText();
-        console.log('ReaRead: Tracking started');
-        break;
-        
-      case 'STOP_TRACKING':
-        this.isActive = false;
-        this.gazeCursor?.style.setProperty('display', 'none');
-        console.log('ReaRead: Tracking stopped');
-        break;
-        
-      case 'UPDATE_GAZE_VISUALIZATION':
-        if (message.data) {
-          this.updateGazeCursor(message.data.x, message.data.y);
-        }
-        break;
-        
-      case 'UPDATE_SETTINGS':
-        if (message.settings) {
-          this.settings = { ...this.settings, ...message.settings };
-        }
-        break;
-    }
-    
-    return true; // Required for async sendResponse
-  }
-
-  // Simulate gaze data for testing (will be replaced with actual eye tracking)
-  private simulateGaze() {
-    if (!this.isActive) return;
-    
-    const x = Math.random() * window.innerWidth;
-    const y = Math.random() * window.innerHeight;
-    
-    this.updateGazeCursor(x, y);
-    
-    // Schedule next update
-    setTimeout(() => this.simulateGaze(), 100);
+    statusBadge!.textContent = "ReaRead • Tracking ON";
+    statusBadge!.style.background = "rgba(16,185,129,.95)";
+    console.log("[ReaRead] Camera started successfully.");
+  } catch (err) {
+    console.error("[ReaRead] getUserMedia error:", err);
+    ensureOverlay();
+    statusBadge!.textContent = "ReaRead • Camera Error";
+    statusBadge!.style.background = "rgba(239,68,68,.95)";
   }
 }
 
-// Initialize the content script
-const reaRead = new ReaReadContent();
 
-// For testing
-if (import.meta.env.DEV) {
-  // @ts-ignore
-  window.reaRead = reaRead;
+function stopCamera() {
+  if (!isActive) {
+    console.log("[ReaRead] Camera already inactive, skipping stop");
+    return;
+  }
+  
+  if (stream) {
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+  }
+  
+  isActive = false;
+  ensureOverlay();
+  statusBadge!.textContent = "ReaRead • Tracking OFF";
+  statusBadge!.style.background = "rgba(107,114,128,.95)";
+  
+  if (videoEl) {
+    videoEl.srcObject = null;
+  }
+  
+  console.log("[ReaRead] ✅ Camera stopped");
 }
+
+// Cleanup on page unload
+window.addEventListener("beforeunload", () => {
+  if (isActive) {
+    stopCamera();
+  }
+});
+
+// Message listener
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  console.log("[ReaRead] Message received:", msg?.type);
+  
+  if (msg?.type === "PING") {
+    sendResponse?.({ pong: true });
+    return true;
+  }
+  
+  if (msg?.type === "START_TRACKING") {
+    startCamera().then(() => {
+      sendResponse?.({ ok: true });
+    }).catch((err) => {
+      console.error("[ReaRead] Start tracking error:", err);
+      sendResponse?.({ ok: false, error: err.message });
+    });
+    return true; // Async response
+  }
+  
+  if (msg?.type === "STOP_TRACKING") {
+    stopCamera();
+    sendResponse?.({ ok: true });
+    return true;
+  }
+  
+  if (msg?.type === "UPDATE_GAZE_VISUALIZATION") {
+    // Gaze data visualization için hazır
+    // TODO: Implement gaze visualization
+    sendResponse?.({ ok: true });
+    return true;
+  }
+  
+  return false;
+});
+
+console.log("[ReaRead] 🚀 Content script loaded and ready");

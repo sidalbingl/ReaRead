@@ -1,12 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
-// Icons will be added later
 import './styles/main.css';
 
 const App = () => {
-  const [isActive, setIsActive] = useState<boolean>(false);
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [showSettings, setShowSettings] = useState<boolean>(false);
+  const [isActive, setIsActive] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [settings, setSettings] = useState({
     autoStart: false,
     ttsEnabled: true,
@@ -19,7 +18,7 @@ const App = () => {
     // Load settings from chrome.storage
     chrome.storage.sync.get('settings', (data) => {
       if (data.settings) {
-        setSettings(prev => ({ ...prev, ...data.settings }));
+        setSettings((prev) => ({ ...prev, ...data.settings }));
       }
     });
 
@@ -33,14 +32,12 @@ const App = () => {
     setIsLoading(true);
     try {
       if (isActive) {
-        // Stop tracking
-        const response = await chrome.runtime.sendMessage({ type: 'STOP_TRACKING' });
+        await chrome.runtime.sendMessage({ type: 'STOP_TRACKING' });
         setIsActive(false);
       } else {
-        // Start tracking
-        const response = await chrome.runtime.sendMessage({ 
+        await chrome.runtime.sendMessage({
           type: 'START_TRACKING',
-          settings 
+          settings,
         });
         setIsActive(true);
       }
@@ -51,7 +48,7 @@ const App = () => {
     }
   };
 
-  const saveSettings = (newSettings: any) => {
+  const saveSettings = (newSettings: Partial<typeof settings>) => {
     const updatedSettings = { ...settings, ...newSettings };
     setSettings(updatedSettings);
     chrome.storage.sync.set({ settings: updatedSettings });
@@ -62,8 +59,8 @@ const App = () => {
       <header className="app-header">
         <h1>ReaRead</h1>
         <div className="header-actions">
-          <button 
-            className="icon-button" 
+          <button
+            className="icon-button"
             onClick={() => setShowSettings(!showSettings)}
             aria-label="Settings"
           >
@@ -76,40 +73,46 @@ const App = () => {
         {showSettings ? (
           <div className="settings-panel">
             <h2>Settings</h2>
+
             <div className="setting-item">
               <label>
-                <input 
-                  type="checkbox" 
+                <input
+                  type="checkbox"
                   checked={settings.autoStart}
                   onChange={(e) => saveSettings({ autoStart: e.target.checked })}
                 />
                 Auto-start on page load
               </label>
             </div>
+
             <div className="setting-item">
               <label>
-                <input 
-                  type="checkbox" 
+                <input
+                  type="checkbox"
                   checked={settings.ttsEnabled}
                   onChange={(e) => saveSettings({ ttsEnabled: e.target.checked })}
                 />
                 Enable Text-to-Speech
               </label>
             </div>
+
             <div className="setting-item">
               <label>
-                <input 
-                  type="checkbox" 
+                <input
+                  type="checkbox"
                   checked={settings.showHighlights}
-                  onChange={(e) => saveSettings({ showHighlights: e.target.checked })}
+                  onChange={(e) =>
+                    saveSettings({ showHighlights: e.target.checked })
+                  }
                 />
                 Show reading highlights
               </label>
             </div>
+
             <div className="setting-item">
               <label>
                 Language:
-                <select 
+                <select
                   value={settings.language}
                   onChange={(e) => saveSettings({ language: e.target.value })}
                 >
@@ -122,20 +125,26 @@ const App = () => {
                 </select>
               </label>
             </div>
+
             <div className="setting-item">
               <label>
                 Confidence Threshold: {settings.confidenceThreshold.toFixed(1)}
-                <input 
-                  type="range" 
-                  min="0.1" 
-                  max="1" 
-                  step="0.1" 
+                <input
+                  type="range"
+                  min="0.1"
+                  max="1"
+                  step="0.1"
                   value={settings.confidenceThreshold}
-                  onChange={(e) => saveSettings({ confidenceThreshold: parseFloat(e.target.value) })}
+                  onChange={(e) =>
+                    saveSettings({
+                      confidenceThreshold: parseFloat(e.target.value),
+                    })
+                  }
                 />
               </label>
             </div>
-            <button 
+
+            <button
               className="close-settings"
               onClick={() => setShowSettings(false)}
             >
@@ -148,32 +157,22 @@ const App = () => {
               <div className={`status-dot ${isActive ? 'active' : ''}`}></div>
               <span>{isActive ? 'Active' : 'Inactive'}</span>
             </div>
-            
-            <button 
+
+            <button
               className={`primary-button ${isActive ? 'stop' : 'start'}`}
               onClick={toggleTracking}
               disabled={isLoading}
             >
-              {isLoading ? (
-                'Loading...'
-              ) : isActive ? (
-                <>
-                  👁️ Stop Tracking
-                </>
-              ) : (
-                <>
-                  ⚡ Start Reading
-                </>
-              )}
+              {isLoading
+                ? 'Loading...'
+                : isActive
+                ? '👁️ Stop Tracking'
+                : '⚡ Start Reading'}
             </button>
 
             <div className="quick-actions">
-              <button className="secondary-button">
-                📚 Reading History
-              </button>
-              <button className="secondary-button">
-                ℹ️ Help
-              </button>
+              <button className="secondary-button">📚 Reading History</button>
+              <button className="secondary-button">ℹ️ Help</button>
             </div>
           </div>
         )}

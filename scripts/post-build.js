@@ -15,6 +15,12 @@ fs.copyFileSync(
   path.join(distDir, 'manifest.json')
 );
 
+// Sandbox.html'i kopyala
+fs.copyFileSync(
+  path.join(publicDir, 'sandbox.html'),
+  path.join(distDir, 'sandbox.html')
+);
+
 // popup.html'i taşı
 const popupSource = path.join(distDir, 'src', 'popup', 'index.html');
 const popupDest = path.join(distDir, 'popup.html');

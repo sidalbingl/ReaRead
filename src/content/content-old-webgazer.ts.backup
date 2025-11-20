@@ -1,0 +1,1517 @@
+// Enhanced Content Script - MAXIMUM ACCURACY MODE
+// Optimized for reading behavior analysis
+
+declare const webgazer: any;
+
+let stream: MediaStream | null = null;
+let overlayRoot: HTMLDivElement | null = null;
+let statusBadge: HTMLDivElement | null = null;
+let videoEl: HTMLVideoElement | null = null;
+let isActive = false;
+let isWebGazerActive = false;
+let isCalibrated = false;
+
+// 🎯 Analytics Dashboard için değişkenler
+let analyticsPanel: HTMLDivElement | null = null;
+let gazeIndicator: HTMLDivElement | null = null;
+let heatmapCanvas: HTMLCanvasElement | null = null;
+let heatmapCtx: CanvasRenderingContext2D | null = null;
+let heatmapRenderInterval: number | null = null;
+
+// Gaze analiz
+let lastGazePoint: { x: number; y: number } | null = null;
+let gazeDataBuffer: GazePoint[] = [];
+let fixationCandidate: FixationCandidate | null = null;
+let fixationPoints: { x: number; y: number; duration: number; element?: HTMLElement }[] = [];
+
+// 📊 Analytics metrics
+let totalFixations = 0;
+let totalSaccades = 0;
+let avgFixationDuration = 0;
+let totalGazePoints = 0;
+let sessionStartTime = 0;
+let lastProcessTime = 0;
+let totalFixationDuration = 0; // ✅ NEW: Track total duration separately
+
+// ✅ NEW: Reading behavior tracking
+let currentParagraph: HTMLElement | null = null;
+let paragraphReadingData = new Map<HTMLElement, ParagraphData>();
+
+// ✅ NEW: Adaptive thresholds based on user behavior
+let adaptiveDispersionThreshold = 50; // Will adjust based on user
+let adaptiveFixationDuration = 200;
+
+// Thresholds
+const BASE_DISPERSION_THRESHOLD = 50; // px
+const MIN_FIXATION_DURATION = 100; // ms
+const MAX_FIXATION_DURATION = 800; // ms
+
+// ---------------------------------------------------------
+// 📦 Type Definitions
+// ---------------------------------------------------------
+interface GazePoint {
+  x: number;
+  y: number;
+  timestamp: number;
+  velocity?: number;
+  confidence?: number; // ✅ NEW: Track prediction confidence
+}
+
+interface FixationCandidate {
+  points: { x: number; y: number; timestamp: number }[];
+  startTime: number;
+}
+
+interface CalibrationData {
+  timestamp: number;
+  screenWidth: number;
+  screenHeight: number;
+  points: CalibrationPoint[];
+  webgazerModel: any;
+  version: string;
+  accuracy?: number; // ✅ NEW: Store calibration accuracy
+}
+
+interface CalibrationPoint {
+  x: number;
+  y: number;
+  confidence: number;
+  type?: 'click' | 'hover' | 'scroll';
+}
+
+// ✅ NEW: Paragraph reading data
+interface ParagraphData {
+  element: HTMLElement;
+  fixations: number;
+  totalDuration: number;
+  firstVisit: number;
+  lastVisit: number;
+  textLength: number;
+  difficulty?: 'easy' | 'medium' | 'hard'; // Based on reading pattern
+  needsHelp?: boolean;
+}
+
+// ---------------------------------------------------------
+// 🔄 PERSISTENT CALIBRATION SYSTEM
+// ---------------------------------------------------------
+class PersistentCalibration {
+  private storageKey = 'rearead_calibration_data';
+
+  async initialize() {
+    const savedCalibration = await this.loadCalibration();
+
+    if (savedCalibration && this.isCalibrationValid(savedCalibration)) {
+      console.log("[ReaRead] 🎯 Using saved calibration");
+      await this.restoreCalibration(savedCalibration);
+      isCalibrated = true;
+      
+      if (statusBadge) {
+        statusBadge.textContent = "ReaRead • Active ✓";
+        statusBadge.style.background = "rgba(16,185,129,.95)";
+      }
+
+      createAnalyticsPanel();
+      createGazeIndicator();
+      createHeatmap();
+
+      implicitCalibration.start();
+      
+      return true;
+    } else {
+      console.log("[ReaRead] 🆕 First time setup needed");
+      await this.performFirstTimeCalibration();
+      return false;
+    }
+  }
+
+  private async loadCalibration(): Promise<CalibrationData | null> {
+    try {
+      const result = await chrome.storage.local.get([this.storageKey]);
+
+      if (result[this.storageKey]) {
+        return JSON.parse(result[this.storageKey]);
+      }
+
+      return null;
+    } catch (err) {
+      console.error("[ReaRead] Failed to load calibration:", err);
+      return null;
+    }
+  }
+
+  private isCalibrationValid(data: CalibrationData): boolean {
+    const now = Date.now();
+    const age = now - data.timestamp;
+    
+    const MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
+    
+    if (age > MAX_AGE) {
+      console.log("[ReaRead] Calibration expired, needs refresh");
+      return false;
+    }
+
+    if (!data.points || data.points.length < 3) {
+      return false;
+    }
+
+    if (data.screenWidth !== window.innerWidth || 
+        data.screenHeight !== window.innerHeight) {
+      console.log("[ReaRead] Screen size changed");
+      return this.askForRecalibration();
+    }
+
+    return true;
+  }
+
+  private async restoreCalibration(data: CalibrationData) {
+    if (typeof webgazer === "undefined") return;
+
+    if (data.webgazerModel) {
+      try {
+        console.log("[ReaRead] ✅ Restoring WebGazer model");
+        this.reapplyCalibrationPoints(data.points);
+      } catch (err) {
+        console.error("[ReaRead] Failed to restore model:", err);
+        this.reapplyCalibrationPoints(data.points);
+      }
+    } else {
+      this.reapplyCalibrationPoints(data.points);
+    }
+  }
+
+  private reapplyCalibrationPoints(points: CalibrationPoint[]) {
+    if (typeof webgazer === "undefined") return;
+
+    points.forEach(point => {
+      const repetitions = Math.ceil(point.confidence * 5);
+      for (let i = 0; i < repetitions; i++) {
+        setTimeout(() => {
+          webgazer.recordScreenPosition(point.x, point.y);
+        }, i * 50);
+      }
+    });
+  }
+
+  private async performFirstTimeCalibration() {
+    const smartCalib = new SmartCalibration();
+    await smartCalib.start();
+    await this.saveCalibration();
+  }
+
+  async saveCalibration() {
+    try {
+      let webgazerModel = null;
+      if (typeof webgazer !== "undefined") {
+        try {
+          webgazerModel = "saved";
+        } catch (err) {
+          console.warn("[ReaRead] Could not extract model data:", err);
+        }
+      }
+
+      const calibrationData: CalibrationData = {
+        timestamp: Date.now(),
+        screenWidth: window.innerWidth,
+        screenHeight: window.innerHeight,
+        points: implicitCalibration.interactions.map(i => ({
+          x: i.x,
+          y: i.y,
+          confidence: i.confidence,
+          type: i.type
+        })),
+        webgazerModel: webgazerModel,
+        version: '2.0',
+        accuracy: adaptiveDispersionThreshold // Store learned threshold
+      };
+
+      await chrome.storage.local.set({
+        [this.storageKey]: JSON.stringify(calibrationData)
+      });
+
+      console.log("[ReaRead] ✅ Calibration saved successfully");
+    } catch (err) {
+      console.error("[ReaRead] Failed to save calibration:", err);
+    }
+  }
+
+  private askForRecalibration(): boolean {
+    const notification = document.createElement('div');
+    notification.style.cssText = `
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: rgba(17, 24, 39, 0.95);
+      color: white;
+      padding: 16px 20px;
+      border-radius: 12px;
+      font-family: system-ui;
+      font-size: 14px;
+      z-index: 9999999;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      max-width: 320px;
+      backdrop-filter: blur(10px);
+    `;
+
+    notification.innerHTML = `
+      <div style="margin-bottom: 12px;">
+        <strong>📐 Screen size changed</strong><br>
+        <span style="opacity: 0.8; font-size: 13px;">
+          Recalibrate for better accuracy?
+        </span>
+      </div>
+      <div style="display: flex; gap: 8px;">
+        <button id="recalibrate-yes" style="
+          flex: 1;
+          background: #3b82f6;
+          border: none;
+          color: white;
+          padding: 8px;
+          border-radius: 6px;
+          cursor: pointer;
+          font-size: 13px;
+          font-weight: 600;
+        ">Yes (3 sec)</button>
+        <button id="recalibrate-no" style="
+          flex: 1;
+          background: rgba(255,255,255,0.1);
+          border: none;
+          color: white;
+          padding: 8px;
+          border-radius: 6px;
+          cursor: pointer;
+          font-size: 13px;
+        ">Use Old</button>
+      </div>
+    `;
+
+    document.body.appendChild(notification);
+
+    let resolved = false;
+    const resolveFunc = (value: boolean) => {
+      if (!resolved) {
+        resolved = true;
+        notification.remove();
+        if (!value) {
+          this.performFirstTimeCalibration();
+        }
+      }
+    };
+
+    document.getElementById('recalibrate-yes')?.addEventListener('click', () => {
+      resolveFunc(false);
+    });
+
+    document.getElementById('recalibrate-no')?.addEventListener('click', () => {
+      resolveFunc(true);
+    });
+
+    setTimeout(() => {
+      if (document.body.contains(notification)) {
+        resolveFunc(true);
+      }
+    }, 10000);
+
+    return true;
+  }
+
+  startAutoSave() {
+    setInterval(async () => {
+      if (isCalibrated && implicitCalibration.interactions.length > 0) {
+        await this.saveCalibration();
+        console.log("[ReaRead] 💾 Auto-saved calibration");
+      }
+    }, 120000); // 2 minutes
+  }
+}
+
+// ---------------------------------------------------------
+// 🤫 IMPLICIT CALIBRATION
+// ---------------------------------------------------------
+class ImplicitCalibration {
+  interactions: Array<{
+    x: number;
+    y: number;
+    type: 'click' | 'scroll' | 'hover';
+    timestamp: number;
+    confidence: number;
+  }> = [];
+
+  private isCollecting = true;
+  private collectionTarget = 30;
+
+  start() {
+    console.log("[ReaRead] 🤫 Starting implicit calibration...");
+    
+    document.addEventListener('click', (e) => {
+      if (!this.isCollecting) return;
+      this.addCalibrationPoint(e.clientX, e.clientY, 'click', 1.0);
+    });
+
+    document.addEventListener('focusin', (e) => {
+      if (!this.isCollecting) return;
+      const target = e.target as HTMLElement;
+      const rect = target.getBoundingClientRect();
+      
+      this.addCalibrationPoint(
+        rect.left + rect.width / 2,
+        rect.top + rect.height / 2,
+        'hover',
+        0.8
+      );
+    });
+
+    let scrollTimeout: number;
+    document.addEventListener('scroll', () => {
+      clearTimeout(scrollTimeout);
+      scrollTimeout = window.setTimeout(() => {
+        if (!this.isCollecting) return;
+        
+        this.addCalibrationPoint(
+          window.innerWidth / 2,
+          window.innerHeight / 2,
+          'scroll',
+          0.5
+        );
+      }, 150);
+    });
+
+    document.addEventListener('mouseover', (e) => {
+      if (!this.isCollecting) return;
+      const target = e.target as HTMLElement;
+      
+      if (target.tagName === 'A' || target.closest('a')) {
+        this.addCalibrationPoint(e.clientX, e.clientY, 'hover', 0.7);
+      }
+    });
+  }
+
+  private addCalibrationPoint(
+    x: number, 
+    y: number, 
+    type: 'click' | 'scroll' | 'hover',
+    confidence: number
+  ) {
+    if (typeof webgazer !== "undefined") {
+      const repetitions = Math.ceil(confidence * 3);
+      for (let i = 0; i < repetitions; i++) {
+        webgazer.recordScreenPosition(x, y);
+      }
+    }
+
+    this.interactions.push({
+      x, y, type, confidence,
+      timestamp: Date.now()
+    });
+
+    console.log(
+      `[Implicit] ${this.interactions.length}/${this.collectionTarget} points collected`
+    );
+
+    if (this.interactions.length >= this.collectionTarget) {
+      this.finishCalibration();
+    }
+
+    this.showProgress();
+  }
+
+  private showProgress() {
+    const progress = Math.min(
+      (this.interactions.length / this.collectionTarget) * 100, 
+      100
+    );
+
+    if (statusBadge) {
+      statusBadge.textContent = `ReaRead • Calibrating ${Math.round(progress)}%`;
+      statusBadge.style.background = `rgba(251,191,36,${0.5 + progress / 200})`;
+    }
+  }
+
+  private async finishCalibration() {
+    this.isCollecting = false;
+    isCalibrated = true;
+
+    console.log("[Implicit] ✅ Calibration complete!");
+
+    if (statusBadge) {
+      statusBadge.textContent = "ReaRead • Active ✓";
+      statusBadge.style.background = "rgba(16,185,129,.95)";
+    }
+
+    // ✅ Perform accuracy validation
+    const accuracy = await performCalibrationValidation();
+    
+    // Show accuracy feedback to user
+    showAccuracyFeedback(accuracy);
+
+    createAnalyticsPanel();
+    createGazeIndicator();
+    createHeatmap();
+
+    this.continuousImprovement();
+  }
+
+  private continuousImprovement() {
+    let clickCount = 0;
+    document.addEventListener('click', (e) => {
+      clickCount++;
+      if (clickCount % 10 === 0 && typeof webgazer !== "undefined") {
+        webgazer.recordScreenPosition(e.clientX, e.clientY);
+      }
+    });
+  }
+}
+
+// ---------------------------------------------------------
+// 🚀 SMART CALIBRATION (Hybrid - 3 points quick)
+// ---------------------------------------------------------
+class SmartCalibration {
+  async start() {
+    await this.quickStartCalibration();
+    this.startImplicitImprovement();
+  }
+
+  private async quickStartCalibration() {
+    return new Promise<void>((resolve) => {
+      const overlay = document.createElement('div');
+      overlay.style.cssText = `
+        position: fixed;
+        top: 0; left: 0;
+        width: 100vw;
+        height: 100vh;
+        background: rgba(0, 0, 0, 0.7);
+        z-index: 9999999;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        font-family: system-ui;
+      `;
+
+      overlay.innerHTML = `
+        <style>
+          @keyframes pulse {
+            0%, 100% { transform: translate(-50%, -50%) scale(1); }
+            50% { transform: translate(-50%, -50%) scale(1.2); }
+          }
+          @keyframes slideDown {
+            from { transform: translate(-50%, -20px); opacity: 0; }
+            to { transform: translate(-50%, 0); opacity: 1; }
+          }
+          @keyframes slideUp {
+            from { transform: translate(-50%, 0); opacity: 1; }
+            to { transform: translate(-50%, -20px); opacity: 0; }
+          }
+        </style>
+        <div style="color: white; text-align: center; max-width: 500px; margin-bottom: 40px;">
+          <h2 style="font-size: 28px; margin-bottom: 12px;">👁️ Quick Setup</h2>
+          <p style="font-size: 16px; opacity: 0.9; line-height: 1.5;">
+            Look at the red dot and <strong>click it once</strong>.<br>
+            This takes only <strong>3 seconds</strong>!
+          </p>
+        </div>
+        <div id="calibration-target" style="
+          width: 24px;
+          height: 24px;
+          background: #ef4444;
+          border: 4px solid white;
+          border-radius: 50%;
+          cursor: pointer;
+          animation: pulse 0.8s ease-in-out infinite;
+          box-shadow: 0 0 30px rgba(239, 68, 68, 0.8);
+        "></div>
+      `;
+
+      document.body.appendChild(overlay);
+
+      const points = [
+        { x: window.innerWidth / 2, y: window.innerHeight / 2 },
+        { x: window.innerWidth * 0.25, y: window.innerHeight * 0.3 },
+        { x: window.innerWidth * 0.75, y: window.innerHeight * 0.7 },
+      ];
+
+      let currentIndex = 0;
+      const target = document.getElementById('calibration-target')!;
+
+      const showPoint = () => {
+        const point = points[currentIndex];
+        target.style.position = 'fixed';
+        target.style.left = `${point.x}px`;
+        target.style.top = `${point.y}px`;
+        target.style.transform = 'translate(-50%, -50%)';
+      };
+
+      target.addEventListener('click', () => {
+        const point = points[currentIndex];
+        
+        if (typeof webgazer !== "undefined") {
+          for (let i = 0; i < 5; i++) {
+            setTimeout(() => {
+              webgazer.recordScreenPosition(point.x, point.y);
+            }, i * 50);
+          }
+        }
+
+        currentIndex++;
+
+        if (currentIndex >= points.length) {
+          overlay.remove();
+          isCalibrated = true;
+          
+          this.showSuccessToast();
+          
+          resolve();
+        } else {
+          showPoint();
+        }
+      });
+
+      showPoint();
+    });
+  }
+
+  private showSuccessToast() {
+    const toast = document.createElement('div');
+    toast.style.cssText = `
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #10b981;
+      color: white;
+      padding: 12px 24px;
+      border-radius: 8px;
+      font-family: system-ui;
+      font-size: 14px;
+      font-weight: 600;
+      z-index: 9999999;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+      animation: slideDown 0.3s ease-out;
+    `;
+    toast.textContent = '✓ All set! ReaRead is now tracking';
+    document.body.appendChild(toast);
+
+    setTimeout(() => {
+      toast.style.animation = 'slideUp 0.3s ease-out';
+      setTimeout(() => toast.remove(), 300);
+    }, 2000);
+  }
+
+  private startImplicitImprovement() {
+    implicitCalibration.start();
+  }
+}
+
+// Global instances
+const persistentCalibration = new PersistentCalibration();
+const implicitCalibration = new ImplicitCalibration();
+
+// ---------------------------------------------------------
+// 🎯 CALIBRATION ACCURACY VALIDATION
+// ---------------------------------------------------------
+async function performCalibrationValidation(): Promise<number> {
+  await new Promise(resolve => setTimeout(resolve, 1000));
+
+  const validationPoints = [
+    { x: window.innerWidth * 0.25, y: window.innerHeight * 0.25 },
+    { x: window.innerWidth * 0.75, y: window.innerHeight * 0.75 },
+    { x: window.innerWidth * 0.5, y: window.innerHeight * 0.5 },
+  ];
+  
+  let totalError = 0;
+  let validPredictions = 0;
+  
+  for (const point of validationPoints) {
+    const predictions: { x: number; y: number }[] = [];
+    
+    for (let i = 0; i < 10; i++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      
+      if (typeof webgazer !== "undefined") {
+        try {
+          const pred = webgazer.getCurrentPrediction();
+          if (pred && pred.x && pred.y) {
+            predictions.push({ x: pred.x, y: pred.y });
+          }
+        } catch (err) {
+          console.warn("[Validation] Could not get prediction:", err);
+        }
+      }
+    }
+    
+    if (predictions.length > 0) {
+      const avgPred = {
+        x: predictions.reduce((sum, p) => sum + p.x, 0) / predictions.length,
+        y: predictions.reduce((sum, p) => sum + p.y, 0) / predictions.length,
+      };
+      
+      const error = Math.sqrt(
+        Math.pow(avgPred.x - point.x, 2) + 
+        Math.pow(avgPred.y - point.y, 2)
+      );
+      
+      totalError += error;
+      validPredictions++;
+    }
+  }
+  
+  if (validPredictions === 0) {
+    console.warn("[Validation] No valid predictions collected");
+    return 999;
+  }
+  
+  const avgError = Math.round(totalError / validPredictions);
+  console.log(`[Validation] Average accuracy: ${avgError}px`);
+  
+  // ✅ NEW: Adjust thresholds based on accuracy
+  adaptiveDispersionThreshold = Math.max(40, Math.min(100, avgError * 0.7));
+  console.log(`[Adaptive] Dispersion threshold set to: ${adaptiveDispersionThreshold}px`);
+  
+  return avgError;
+}
+
+function showAccuracyFeedback(errorPx: number) {
+  let quality = "Excellent";
+  let color = "#10b981";
+  let emoji = "🎯";
+  let message = "Tracking is highly accurate!";
+  
+  if (errorPx > 150) {
+    quality = "Fair";
+    color = "#f59e0b";
+    emoji = "⚡";
+    message = "Working well, may improve over time";
+  } else if (errorPx > 100) {
+    quality = "Good";
+    color = "#3b82f6";
+    emoji = "👍";
+    message = "Good accuracy achieved!";
+  } else if (errorPx > 60) {
+    quality = "Very Good";
+    color = "#8b5cf6";
+    emoji = "⭐";
+    message = "Great tracking accuracy!";
+  }
+  
+  if (errorPx > 300) {
+    console.log("[Validation] Accuracy too low, skipping feedback");
+    return;
+  }
+  
+  const feedback = document.createElement('div');
+  feedback.style.cssText = `
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: ${color};
+    color: white;
+    padding: 24px 32px;
+    border-radius: 16px;
+    font-family: system-ui;
+    font-size: 16px;
+    z-index: 9999999;
+    text-align: center;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.4);
+    animation: slideDown 0.4s ease-out;
+  `;
+  
+  feedback.innerHTML = `
+    <div style="font-size: 48px; margin-bottom: 12px;">${emoji}</div>
+    <div style="font-weight: 700; font-size: 18px; margin-bottom: 6px;">
+      Accuracy: ${errorPx}px
+    </div>
+    <div style="opacity: 0.95; font-size: 15px; font-weight: 600; margin-bottom: 4px;">
+      ${quality}
+    </div>
+    <div style="opacity: 0.85; font-size: 13px;">
+      ${message}
+    </div>
+  `;
+  
+  document.body.appendChild(feedback);
+  
+  setTimeout(() => {
+    feedback.style.animation = 'slideUp 0.3s ease-out';
+    setTimeout(() => feedback.remove(), 300);
+  }, 3000);
+  
+  setTimeout(() => {
+    addAccuracyBadgeToPanel(errorPx, quality);
+  }, 3500);
+}
+
+function addAccuracyBadgeToPanel(errorPx: number, quality: string) {
+  if (!analyticsPanel) return;
+  
+  if (document.getElementById('accuracy-badge')) return;
+  
+  const badge = document.createElement('div');
+  badge.id = 'accuracy-badge';
+  badge.style.cssText = `
+    background: rgba(139, 92, 246, 0.1);
+    border-radius: 8px;
+    padding: 12px;
+    margin-top: 12px;
+  `;
+  
+  badge.innerHTML = `
+    <div style="font-size: 11px; color: #c4b5fd; margin-bottom: 4px;">ACCURACY</div>
+    <div style="font-size: 20px; font-weight: 700;">${errorPx}px</div>
+    <div style="font-size: 11px; color: #c4b5fd; margin-top: 2px;">${quality}</div>
+  `;
+  
+  const heatmapBtn = document.getElementById('toggle-heatmap');
+  if (heatmapBtn && heatmapBtn.parentElement) {
+    heatmapBtn.parentElement.insertBefore(badge, heatmapBtn);
+  }
+}
+
+// ---------------------------------------------------------
+// 📊 Analytics Dashboard
+// ---------------------------------------------------------
+function createAnalyticsPanel() {
+  if (analyticsPanel) return;
+
+  analyticsPanel = document.createElement("div");
+  analyticsPanel.style.cssText = `
+    position: fixed;
+    bottom: 20px;
+    left: 20px;
+    width: 320px;
+    background: rgba(17, 24, 39, 0.95);
+    backdrop-filter: blur(10px);
+    border-radius: 16px;
+    padding: 20px;
+    color: white;
+    font-family: system-ui, sans-serif;
+    z-index: 9999998;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  `;
+
+  analyticsPanel.innerHTML = `
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+      <h3 style="margin: 0; font-size: 16px; font-weight: 600;">📊 Gaze Analytics</h3>
+      <button id="rearead-close-analytics" style="
+        background: rgba(239, 68, 68, 0.2);
+        border: none;
+        color: #ef4444;
+        border-radius: 8px;
+        padding: 4px 8px;
+        cursor: pointer;
+        font-size: 12px;
+      ">✕</button>
+    </div>
+    
+    <div style="display: grid; gap: 12px;">
+      <div style="background: rgba(59, 130, 246, 0.1); border-radius: 8px; padding: 12px;">
+        <div style="font-size: 11px; color: #93c5fd; margin-bottom: 4px;">SESSION TIME</div>
+        <div id="session-time" style="font-size: 20px; font-weight: 700;">00:00</div>
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+        <div style="background: rgba(16, 185, 129, 0.1); border-radius: 8px; padding: 10px;">
+          <div style="font-size: 10px; color: #6ee7b7; margin-bottom: 4px;">FIXATIONS</div>
+          <div id="total-fixations" style="font-size: 18px; font-weight: 700;">0</div>
+        </div>
+        
+        <div style="background: rgba(251, 191, 36, 0.1); border-radius: 8px; padding: 10px;">
+          <div style="font-size: 10px; color: #fcd34d; margin-bottom: 4px;">SACCADES</div>
+          <div id="total-saccades" style="font-size: 18px; font-weight: 700;">0</div>
+        </div>
+      </div>
+
+      <div style="background: rgba(168, 85, 247, 0.1); border-radius: 8px; padding: 12px;">
+        <div style="font-size: 11px; color: #c4b5fd; margin-bottom: 4px;">AVG FIXATION</div>
+        <div id="avg-fixation" style="font-size: 20px; font-weight: 700;">0ms</div>
+      </div>
+
+      <div style="background: rgba(236, 72, 153, 0.1); border-radius: 8px; padding: 12px;">
+        <div style="font-size: 11px; color: #f9a8d4; margin-bottom: 4px;">READING SPEED</div>
+        <div id="reading-speed" style="font-size: 20px; font-weight: 700;">0 wpm</div>
+      </div>
+
+      <button id="toggle-heatmap" style="
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        border: none;
+        color: white;
+        border-radius: 8px;
+        padding: 12px;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 600;
+        transition: transform 0.2s;
+      ">
+        🔥 Show Heatmap
+      </button>
+    </div>
+  `;
+
+  document.body.appendChild(analyticsPanel);
+
+  const closeBtn = document.getElementById("rearead-close-analytics");
+  closeBtn?.addEventListener("click", () => {
+    analyticsPanel?.remove();
+    analyticsPanel = null;
+  });
+
+  const heatmapBtn = document.getElementById("toggle-heatmap");
+  heatmapBtn?.addEventListener("click", toggleHeatmap);
+
+  sessionStartTime = Date.now();
+  setInterval(updateSessionTime, 1000);
+}
+
+function updateSessionTime() {
+  if (!sessionStartTime || !analyticsPanel) return;
+  
+  const elapsed = Math.floor((Date.now() - sessionStartTime) / 1000);
+  const minutes = Math.floor(elapsed / 60);
+  const seconds = elapsed % 60;
+  
+  const timeEl = document.getElementById("session-time");
+  if (timeEl) {
+    timeEl.textContent = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+}
+
+function updateAnalytics() {
+  if (!analyticsPanel) return;
+
+  const fixEl = document.getElementById("total-fixations");
+  if (fixEl) fixEl.textContent = String(totalFixations);
+
+  const sacEl = document.getElementById("total-saccades");
+  if (sacEl) sacEl.textContent = String(totalSaccades);
+
+  const avgEl = document.getElementById("avg-fixation");
+  if (avgEl) avgEl.textContent = `${Math.round(avgFixationDuration)}ms`;
+
+  const readingSpeedEl = document.getElementById("reading-speed");
+  if (readingSpeedEl && totalFixations > 0) {
+    const wpm = Math.round((totalFixations / ((Date.now() - sessionStartTime) / 60000)));
+    readingSpeedEl.textContent = `${wpm} wpm`;
+  }
+}
+
+// ---------------------------------------------------------
+// 🎯 Gaze Indicator
+// ---------------------------------------------------------
+function createGazeIndicator() {
+  if (gazeIndicator) return;
+
+  gazeIndicator = document.createElement("div");
+  gazeIndicator.style.cssText = `
+    position: fixed;
+    width: 20px;
+    height: 20px;
+    border: 3px solid #ef4444;
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 9999999;
+    transition: all 0.05s ease-out;
+    box-shadow: 0 0 20px rgba(239, 68, 68, 0.6);
+    display: none;
+  `;
+
+  document.body.appendChild(gazeIndicator);
+}
+
+function updateGazeIndicator(x: number, y: number) {
+  if (!gazeIndicator) return;
+  
+  gazeIndicator.style.left = `${x - 10}px`;
+  gazeIndicator.style.top = `${y - 10}px`;
+  gazeIndicator.style.display = "block";
+}
+
+// ---------------------------------------------------------
+// 🔥 Heatmap
+// ---------------------------------------------------------
+function createHeatmap() {
+  if (heatmapCanvas) return;
+
+  heatmapCanvas = document.createElement("canvas");
+  heatmapCanvas.width = window.innerWidth;
+  heatmapCanvas.height = window.innerHeight;
+  heatmapCanvas.style.cssText = `
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    pointer-events: none;
+    z-index: 9999997;
+    display: none;
+  `;
+
+  document.body.appendChild(heatmapCanvas);
+  heatmapCtx = heatmapCanvas.getContext("2d");
+}
+
+function toggleHeatmap() {
+  if (!heatmapCanvas) createHeatmap();
+  
+  const isVisible = heatmapCanvas!.style.display !== "none";
+  
+  if (isVisible) {
+    heatmapCanvas!.style.display = "none";
+    fixationPoints = [];
+    
+    if (heatmapRenderInterval) {
+      clearInterval(heatmapRenderInterval);
+      heatmapRenderInterval = null;
+    }
+    
+    const btn = document.getElementById("toggle-heatmap");
+    if (btn) btn.textContent = "🔥 Show Heatmap";
+  } else {
+    fixationPoints = [];
+    heatmapCanvas!.style.display = "block";
+    
+    const btn = document.getElementById("toggle-heatmap");
+    if (btn) btn.textContent = "❌ Hide Heatmap";
+    
+    heatmapRenderInterval = window.setInterval(() => {
+      if (heatmapCanvas?.style.display === "none") {
+        if (heatmapRenderInterval) {
+          clearInterval(heatmapRenderInterval);
+          heatmapRenderInterval = null;
+        }
+        return;
+      }
+      drawHeatmap();
+    }, 500);
+  }
+}
+
+function drawHeatmap() {
+  if (!heatmapCtx || !heatmapCanvas) return;
+
+  heatmapCtx.clearRect(0, 0, heatmapCanvas.width, heatmapCanvas.height);
+
+  fixationPoints.forEach((point) => {
+    const intensity = Math.min(point.duration / 1000, 1);
+    const radius = 30 + intensity * 70;
+
+    const gradient = heatmapCtx!.createRadialGradient(
+      point.x, point.y, 0,
+      point.x, point.y, radius
+    );
+
+    const alpha = 0.3 * intensity;
+    gradient.addColorStop(0, `rgba(255, 0, 0, ${alpha})`);
+    gradient.addColorStop(0.5, `rgba(255, 165, 0, ${alpha * 0.5})`);
+    gradient.addColorStop(1, "rgba(255, 255, 0, 0)");
+
+    heatmapCtx!.fillStyle = gradient;
+    heatmapCtx!.fillRect(point.x - radius, point.y - radius, radius * 2, radius * 2);
+  });
+}
+
+// ---------------------------------------------------------
+// Overlay UI
+// ---------------------------------------------------------
+function ensureOverlay() {
+  if (!overlayRoot) {
+    overlayRoot = document.createElement("div");
+    overlayRoot.id = "rearead-overlay";
+    overlayRoot.style.cssText = `
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      z-index: 999999;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    `;
+    document.documentElement.appendChild(overlayRoot);
+  }
+
+  if (!statusBadge) {
+    statusBadge = document.createElement("div");
+    statusBadge.style.cssText = `
+      font-family: system-ui, sans-serif;
+      font-size: 12px;
+      color: #fff;
+      padding: 6px 10px;
+      border-radius: 999px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.2);
+      font-weight: 500;
+    `;
+    overlayRoot.appendChild(statusBadge);
+  }
+
+  if (!videoEl) {
+    videoEl = document.createElement("video");
+    videoEl.autoplay = true;
+    videoEl.muted = true;
+    videoEl.playsInline = true;
+    videoEl.style.cssText = `
+      width: 160px;
+      height: 120px;
+      object-fit: cover;
+      border-radius: 12px;
+      box-shadow: 0 6px 18px rgba(0,0,0,.25);
+      pointer-events: none;
+    `;
+    overlayRoot.appendChild(videoEl);
+  }
+}
+
+// ---------------------------------------------------------
+// 🧮 Advanced Smoothing with Adaptive Window + Confidence
+// ---------------------------------------------------------
+function smoothGazeData(x: number, y: number, confidence?: number): { x: number; y: number } {
+  const currentTime = Date.now();
+  
+  let velocity = 0;
+  if (gazeDataBuffer.length > 0) {
+    const last = gazeDataBuffer[gazeDataBuffer.length - 1];
+    const distance = Math.sqrt(
+      Math.pow(x - last.x, 2) + Math.pow(y - last.y, 2)
+    );
+    const timeDiff = currentTime - last.timestamp;
+    velocity = distance / Math.max(timeDiff, 1);
+  }
+  
+  gazeDataBuffer.push({ x, y, timestamp: currentTime, velocity, confidence });
+  
+  // ✅ NEW: Larger window if low confidence
+  const baseWindowSize = velocity > 0.5 ? 3 : 8;
+  const confidentWindowSize = (confidence && confidence < 0.7) 
+    ? baseWindowSize + 2 
+    : baseWindowSize;
+  
+  if (gazeDataBuffer.length > confidentWindowSize) {
+    gazeDataBuffer.shift();
+  }
+  
+  let totalWeight = 0;
+  let weightedX = 0;
+  let weightedY = 0;
+  
+  gazeDataBuffer.forEach((point, index) => {
+    let weight = Math.pow(1.5, index);
+    
+    // ✅ NEW: Reduce weight if low confidence
+    if (point.confidence && point.confidence < 0.7) {
+      weight *= point.confidence;
+    }
+    
+    weightedX += point.x * weight;
+    weightedY += point.y * weight;
+    totalWeight += weight;
+  });
+  
+  return {
+    x: Math.round(weightedX / totalWeight),
+    y: Math.round(weightedY / totalWeight),
+  };
+}
+
+// ---------------------------------------------------------
+// 🎯 Enhanced I-DT Fixation Detection + Reading Analysis
+// ---------------------------------------------------------
+function analyzeGazeBehavior(x: number, y: number) {
+  const currentTime = Date.now();
+  const smoothedGaze = smoothGazeData(x, y);
+  
+  totalGazePoints++;
+  updateGazeIndicator(smoothedGaze.x, smoothedGaze.y);
+  
+  if (!fixationCandidate) {
+    fixationCandidate = {
+      points: [{ ...smoothedGaze, timestamp: currentTime }],
+      startTime: currentTime,
+    };
+    return;
+  }
+  
+  fixationCandidate.points.push({ ...smoothedGaze, timestamp: currentTime });
+  
+  const dispersion = calculateDispersion(fixationCandidate.points);
+  const duration = currentTime - fixationCandidate.startTime;
+  
+  // ✅ Use adaptive threshold
+  if (dispersion <= adaptiveDispersionThreshold) {
+    if (duration >= MIN_FIXATION_DURATION && duration <= MAX_FIXATION_DURATION) {
+      const centroid = getCentroid(fixationCandidate.points);
+      const element = document.elementFromPoint(centroid.x, centroid.y) as HTMLElement;
+      
+      if (element && element.tagName !== "BODY") {
+        highlightElement(element, duration);
+        
+        // ✅ NEW: Track reading behavior
+        trackReadingBehavior(element, duration);
+      }
+    }
+  } else {
+    if (duration >= MIN_FIXATION_DURATION) {
+      recordFixation(fixationCandidate);
+    }
+    
+    fixationCandidate = {
+      points: [{ ...smoothedGaze, timestamp: currentTime }],
+      startTime: currentTime,
+    };
+    totalSaccades++;
+  }
+  
+  if (duration > MAX_FIXATION_DURATION) {
+    fixationCandidate = null;
+  }
+  
+  updateAnalytics();
+}
+
+// ✅ NEW: Track reading behavior per paragraph
+function trackReadingBehavior(
+  element: HTMLElement, 
+  duration: number
+) {
+  const paragraph = findReadingElement(element);
+  if (!paragraph) return;
+
+  let data = paragraphReadingData.get(paragraph);
+  
+  if (!data) {
+    data = {
+      element: paragraph,
+      fixations: 0,
+      totalDuration: 0,
+      firstVisit: Date.now(),
+      lastVisit: Date.now(),
+      textLength: (paragraph.textContent || '').length,
+    };
+    paragraphReadingData.set(paragraph, data);
+  }
+
+  data.fixations++;
+  data.totalDuration += duration;
+  data.lastVisit = Date.now();
+
+  // ✅ Analyze reading difficulty
+  const wordsPerFixation = countWords(paragraph) / data.fixations;
+  const avgFixationTime = data.totalDuration / data.fixations;
+
+  const previousDifficulty = data.difficulty;
+
+  if (wordsPerFixation < 0.5 || avgFixationTime > 400) {
+    data.difficulty = 'hard';
+    data.needsHelp = true;
+    
+    // ✅ Only log when difficulty first detected as hard
+    if (previousDifficulty !== 'hard') {
+      console.log(`[Reading] User struggling with paragraph:`, {
+        words: countWords(paragraph),
+        fixations: data.fixations,
+        avgTime: avgFixationTime,
+        suggest: 'simplify or explain'
+      });
+    }
+    
+  } else if (wordsPerFixation > 1.5 || avgFixationTime < 200) {
+    data.difficulty = 'easy';
+  } else {
+    data.difficulty = 'medium';
+  }
+}
+
+function findReadingElement(el: HTMLElement): HTMLElement | null {
+  let current: HTMLElement | null = el;
+  
+  while (current && current !== document.body) {
+    const tag = current.tagName;
+    const textLength = (current.textContent || '').trim().length;
+    
+    // Text-heavy elements
+    if ((tag === 'P' || tag === 'DIV' || tag === 'ARTICLE' || tag === 'SECTION') 
+        && textLength > 50) {
+      return current;
+    }
+    
+    current = current.parentElement;
+  }
+  
+  return null;
+}
+
+function countWords(el: HTMLElement): number {
+  return (el.textContent || '')
+    .split(/\s+/)
+    .filter(w => w.length > 0).length;
+}
+
+// ✅ NEW: Export reading data for AI features
+function getReadingData(): ParagraphData[] {
+  return Array.from(paragraphReadingData.values());
+}
+
+function calculateDispersion(points: { x: number; y: number }[]): number {
+  if (points.length < 2) return 0;
+  
+  const xs = points.map(p => p.x);
+  const ys = points.map(p => p.y);
+  
+  const maxX = Math.max(...xs);
+  const minX = Math.min(...xs);
+  const maxY = Math.max(...ys);
+  const minY = Math.min(...ys);
+  
+  return Math.sqrt(Math.pow(maxX - minX, 2) + Math.pow(maxY - minY, 2));
+}
+
+function getCentroid(points: { x: number; y: number }[]): { x: number; y: number } {
+  const sum = points.reduce(
+    (acc, p) => ({ x: acc.x + p.x, y: acc.y + p.y }),
+    { x: 0, y: 0 }
+  );
+  return {
+    x: sum.x / points.length,
+    y: sum.y / points.length,
+  };
+}
+
+function recordFixation(candidate: FixationCandidate) {
+  const centroid = getCentroid(candidate.points);
+  const duration = Date.now() - candidate.startTime;
+  
+  // ✅ Heatmap için (sadece açıkken)
+  if (heatmapCanvas && heatmapCanvas.style.display !== "none") {
+    fixationPoints.push({
+      x: centroid.x,
+      y: centroid.y,
+      duration,
+    });
+  }
+  
+  totalFixations++;
+  
+  // ✅ FIX: Always track duration for analytics
+  totalFixationDuration += duration;
+  avgFixationDuration = totalFixationDuration / totalFixations;
+}
+
+// ---------------------------------------------------------
+// Element Highlighting
+// ---------------------------------------------------------
+const highlightedElements = new Map<HTMLElement, number>();
+
+function highlightElement(element: HTMLElement, duration: number) {
+  const existingDuration = highlightedElements.get(element) || 0;
+  const totalDuration = existingDuration + duration;
+
+  let intensity = Math.min(totalDuration / 2000, 1);
+  let color = intensity > 0.7 ? "rgba(239, 68, 68, 0.3)" :
+               intensity > 0.4 ? "rgba(251, 191, 36, 0.3)" :
+               "rgba(34, 197, 94, 0.3)";
+
+  element.style.backgroundColor = color;
+  element.style.transition = "background-color 0.3s ease";
+
+  highlightedElements.set(element, totalDuration);
+
+  setTimeout(() => {
+    element.style.backgroundColor = "";
+    highlightedElements.delete(element);
+  }, 3000);
+}
+
+// ---------------------------------------------------------
+// Camera başlatma
+// ---------------------------------------------------------
+async function startCamera() {
+  if (isActive) return;
+  try {
+    ensureOverlay();
+    console.log("[ReaRead] Requesting camera access...");
+
+    const constraints = { video: { facingMode: "user", width: 640, height: 480 } };
+    const streamTemp = await navigator.mediaDevices.getUserMedia(constraints);
+
+    stream = streamTemp;
+    isActive = true;
+
+    requestAnimationFrame(async () => {
+      const vid = document.querySelector("video");
+      if (vid) {
+        vid.srcObject = stream;
+        await vid.play();
+      }
+    });
+
+    initWebGazer();
+
+    const hasExistingCalibration = await persistentCalibration.initialize();
+
+    if (!hasExistingCalibration) {
+      statusBadge!.textContent = "ReaRead • Setting up...";
+      statusBadge!.style.background = "rgba(251,191,36,.95)";
+    }
+
+    persistentCalibration.startAutoSave();
+
+    console.log("[ReaRead] ✅ Camera started successfully.");
+  } catch (err) {
+    console.error("[ReaRead] getUserMedia error:", err);
+    ensureOverlay();
+    statusBadge!.textContent = "ReaRead • Camera Error";
+    statusBadge!.style.background = "rgba(239,68,68,.95)";
+  }
+}
+
+// ---------------------------------------------------------
+// Camera durdurma
+// ---------------------------------------------------------
+function stopCamera() {
+  if (!isActive) return;
+
+  if (stream) {
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+  }
+
+  if (isWebGazerActive && typeof webgazer !== "undefined") {
+    webgazer.end();
+    isWebGazerActive = false;
+  }
+
+  isActive = false;
+  isCalibrated = false;
+  
+  if (heatmapRenderInterval) {
+    clearInterval(heatmapRenderInterval);
+    heatmapRenderInterval = null;
+  }
+  
+  if (analyticsPanel) {
+    analyticsPanel.remove();
+    analyticsPanel = null;
+  }
+
+  if (gazeIndicator) {
+    gazeIndicator.remove();
+    gazeIndicator = null;
+  }
+
+  if (heatmapCanvas) {
+    heatmapCanvas.remove();
+    heatmapCanvas = null;
+  }
+
+  ensureOverlay();
+  statusBadge!.textContent = "ReaRead • Tracking OFF";
+  statusBadge!.style.background = "rgba(107,114,128,.95)";
+
+  if (videoEl) {
+    videoEl.srcObject = null;
+  }
+
+  highlightedElements.forEach((_, element) => {
+    element.style.backgroundColor = "";
+  });
+  highlightedElements.clear();
+
+  totalFixations = 0;
+  totalSaccades = 0;
+  avgFixationDuration = 0;
+  totalFixationDuration = 0; // ✅ Reset
+  fixationPoints = [];
+  paragraphReadingData.clear();
+
+  console.log("[ReaRead] ✅ Camera stopped");
+}
+
+// ---------------------------------------------------------
+// WebGazer başlatma
+// ---------------------------------------------------------
+function initWebGazer() {
+  if (typeof webgazer === "undefined") {
+    console.error("[ReaRead] ❌ WebGazer not found.");
+    return;
+  }
+
+  try {
+    webgazer
+      .setRegression("ridge")
+      .setTracker("TFFacemesh")
+      .showVideoPreview(false)
+      .showPredictionPoints(false)
+      .showFaceOverlay(false)
+      .setGazeListener((data: any) => {
+        if (data && isCalibrated) {
+          // FPS throttling: 33ms = 30 FPS
+          if (Date.now() - lastProcessTime < 33) return;
+          lastProcessTime = Date.now();
+          
+          analyzeGazeBehavior(data.x, data.y);
+        }
+      })
+      .begin();
+
+    isWebGazerActive = true;
+    console.log("[ReaRead] ✅ WebGazer initialized.");
+  } catch (err) {
+    console.error("[ReaRead] WebGazer init error:", err);
+  }
+}
+
+// ---------------------------------------------------------
+// 🔌 API: Export for AI features
+// ---------------------------------------------------------
+(window as any).ReaRead = {
+  getReadingData,
+  getParagraphDifficulty: (el: HTMLElement) => {
+    const data = paragraphReadingData.get(el);
+    return data?.difficulty || 'unknown';
+  },
+  needsHelp: (el: HTMLElement) => {
+    const data = paragraphReadingData.get(el);
+    return data?.needsHelp || false;
+  }
+};
+
+// ---------------------------------------------------------
+// Cleanup & Message listener
+// ---------------------------------------------------------
+window.addEventListener("beforeunload", () => {
+  if (isActive) stopCamera();
+});
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  console.log("[ReaRead] Message received:", msg?.type);
+
+  if (msg?.type === "PING") {
+    sendResponse?.({ pong: true });
+    return true;
+  }
+
+  if (msg?.type === "START_TRACKING") {
+    startCamera()
+      .then(() => sendResponse?.({ ok: true }))
+      .catch((err) => {
+        console.error("[ReaRead] Start tracking error:", err);
+        sendResponse?.({ ok: false, error: err.message });
+      });
+    return true;
+  }
+
+  if (msg?.type === "STOP_TRACKING") {
+    stopCamera();
+    sendResponse?.({ ok: true });
+    return true;
+  }
+
+  // ✅ NEW: API endpoints for AI features
+  if (msg?.type === "GET_READING_DATA") {
+    const data = getReadingData();
+    sendResponse?.({ ok: true, data });
+    return true;
+  }
+
+  return false;
+});
+
+console.log("[ReaRead] 🚀 Content script loaded and ready");

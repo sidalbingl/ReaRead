@@ -25,11 +25,57 @@ const state: AppState = {
   settings: { ...defaultSettings },
 };
 
-// Load settings
-chrome.storage.sync.get("settings", (data) => {
-  if (data.settings) state.settings = { ...defaultSettings, ...data.settings };
-  console.log("⚙️ Settings loaded:", state.settings);
+// 🔹 State'i kalıcı storage'a kaydet
+function saveState() {
+  chrome.storage.local.set({ 
+    appState: {
+      isActive: state.isActive,
+      currentTabId: state.currentTabId
+    }
+  });
+  console.log("💾 State saved:", { isActive: state.isActive, currentTabId: state.currentTabId });
+}
+
+// 🔹 State'i storage'dan yükle
+async function loadState() {
+  return new Promise<void>((resolve) => {
+    chrome.storage.local.get(['appState'], (data) => {
+      if (data.appState) {
+        state.isActive = data.appState.isActive || false;
+        state.currentTabId = data.appState.currentTabId;
+        console.log("📥 State loaded:", data.appState);
+      }
+      resolve();
+    });
+  });
+}
+
+// 🔹 Settings'i yükle
+async function loadSettings() {
+  return new Promise<void>((resolve) => {
+    chrome.storage.sync.get("settings", (data) => {
+      if (data.settings) {
+        state.settings = { ...defaultSettings, ...data.settings };
+      }
+      console.log("⚙️ Settings loaded:", state.settings);
+      resolve();
+    });
+  });
+}
+
+// 🔹 Extension başlatıldığında state'i yükle
+chrome.runtime.onStartup.addListener(async () => {
+  await loadState();
+  await loadSettings();
+  console.log("🔄 Extension restarted, state restored");
 });
+
+// 🔹 Extension ilk yüklendiğinde de state'i yükle
+(async () => {
+  await loadState();
+  await loadSettings();
+  console.log("🚀 ReaRead background script loaded");
+})();
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   console.log("📩 Message received:", message);
@@ -47,7 +93,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         break;
 
       case "GET_STATUS":
-        sendResponse?.({ isActive: state.isActive });
+        // 🔹 Mevcut tab ile currentTabId'yi kontrol et
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const isCurrentTabActive = state.isActive && state.currentTabId === activeTab?.id;
+        sendResponse?.({ 
+          isActive: isCurrentTabActive,
+          currentTabId: state.currentTabId 
+        });
         break;
 
       case "UPDATE_SETTINGS":
@@ -69,6 +121,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   })();
 
   return true; // keep port open
+});
+
+// 🔹 Tab kapatıldığında state'i temizle
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === state.currentTabId) {
+    console.log("🗑️ Active tab closed, clearing state");
+    state.isActive = false;
+    state.currentTabId = undefined;
+    saveState();
+  }
 });
 
 // ---- Core flow ----
@@ -98,6 +160,7 @@ async function startForActiveTab(settings?: any) {
       console.warn("⚠️ START_TRACKING send error:", chrome.runtime.lastError.message);
     } else {
       state.isActive = true;
+      saveState(); // 🔹 State'i kaydet
       console.log("✅ START_TRACKING delivered to tab:", activeTab.id);
     }
   });
@@ -122,6 +185,7 @@ async function stopForActiveTab() {
     } else {
       state.isActive = false;
       state.currentTabId = undefined;
+      saveState(); // 🔹 State'i kaydet
       console.log("✅ STOP_TRACKING delivered to tab:", activeTab.id);
     }
   });
@@ -158,7 +222,7 @@ async function ensureContentReady(tabId: number): Promise<boolean> {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ["content.js"], // ✅ DÜZELTME: @crxjs/vite-plugin bu dosyayı oluşturur
+      files: ["content.js"],
     });
     console.log("🧩 content.js manually injected to tab:", tabId);
     
@@ -187,5 +251,3 @@ function processGazeData(data: any, tabId?: number) {
     data: { x: data.x, y: data.y, timestamp: Date.now() },
   });
 }
-
-console.log("🚀 ReaRead background script loaded");

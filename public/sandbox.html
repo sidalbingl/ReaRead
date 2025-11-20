@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>MediaPipe Sandbox</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+    #debug {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      background: rgba(0, 0, 0, 0.8);
+      color: #0f0;
+      padding: 10px;
+      font-family: monospace;
+      font-size: 12px;
+      max-width: 400px;
+      max-height: 300px;
+      overflow: auto;
+      z-index: 10000;
+    }
+    video {
+      display: none;
+    }
+    #debugCanvas {
+      position: fixed;
+      bottom: 10px;
+      right: 10px;
+      border: 2px solid #0f0;
+      background: #000;
+      z-index: 10000;
+    }
+  </style>
+</head>
+<body>
+  <div id="debug">MediaPipe Sandbox Loading...</div>
+  <video id="video" autoplay playsinline></video>
+  <canvas id="debugCanvas" width="320" height="120"></canvas>
+
+  <script type="module">
+    const debug = document.getElementById('debug');
+    const logs = [];
+
+    function log(msg, isError = false) {
+      const timestamp = new Date().toISOString().split('T')[1].slice(0, 12);
+      const prefix = isError ? '❌' : '✅';
+      const logMsg = `[${timestamp}] ${prefix} ${msg}`;
+      console.log(logMsg);
+      logs.push(logMsg);
+      if (logs.length > 20) logs.shift();
+      debug.innerHTML = logs.join('<br>');
+
+      // Send log to parent
+      window.parent.postMessage({
+        type: 'SANDBOX_LOG',
+        message: logMsg,
+        isError
+      }, '*');
+    }
+
+    log('Sandbox initialized');
+
+    // Import MediaPipe and OpenCV from CDN
+    let FaceLandmarker, FilesetResolver;
+    let cv = null;
+
+    async function loadOpenCV() {
+      try {
+        log('Loading OpenCV.js (lightweight version)...');
+
+        return new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          // Use jsdelivr CDN (faster than docs.opencv.org)
+          script.src = 'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.9.0-release.1/dist/opencv.min.js';
+          script.async = true;
+
+          script.onload = () => {
+            // Wait for cv to be ready
+            if (window.cv) {
+              window.cv.onRuntimeInitialized = () => {
+                cv = window.cv;
+                log('OpenCV.js loaded and ready');
+                resolve(true);
+              };
+            } else {
+              setTimeout(() => {
+                if (window.cv && window.cv.onRuntimeInitialized) {
+                  window.cv.onRuntimeInitialized = () => {
+                    cv = window.cv;
+                    log('OpenCV.js loaded and ready');
+                    resolve(true);
+                  };
+                } else {
+                  reject(new Error('OpenCV not available'));
+                }
+              }, 100);
+            }
+          };
+
+          script.onerror = () => reject(new Error('Failed to load OpenCV script'));
+          document.head.appendChild(script);
+        });
+      } catch (error) {
+        log(`Failed to load OpenCV: ${error.message}`, true);
+        return false;
+      }
+    }
+
+    async function loadMediaPipe() {
+      try {
+        log('Loading MediaPipe from CDN...');
+
+        const module = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js');
+        FaceLandmarker = module.FaceLandmarker;
+        FilesetResolver = module.FilesetResolver;
+
+        log('MediaPipe modules loaded');
+        return true;
+      } catch (error) {
+        log(`Failed to load MediaPipe: ${error.message}`, true);
+        return false;
+      }
+    }
+
+    let faceLandmarker = null;
+    let videoElement = null;
+    let isRunning = false;
+    let animationFrameId = null;
+    let lastFrameTime = 0;
+
+    // Initialize MediaPipe
+    async function initializeMediaPipe() {
+      try {
+        log('Initializing MediaPipe Face Landmarker...');
+
+        const vision = await FilesetResolver.forVisionTasks(
+          '../libs/mediapipe/wasm'
+        );
+
+        log('FilesetResolver created');
+
+        // Use local bundled model (faster and more reliable)
+        const modelPath = '../libs/mediapipe/face_landmarker.task';
+        log(`Using bundled local model: ${modelPath}`);
+
+        log('Creating FaceLandmarker (loading from local files)...');
+        const startTime = performance.now();
+
+        faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: modelPath,
+            delegate: 'GPU'
+          },
+          runningMode: 'VIDEO',
+          numFaces: 1,
+          minFaceDetectionConfidence: 0.5,
+          minFacePresenceConfidence: 0.5,
+          minTrackingConfidence: 0.5,
+          outputFaceBlendshapes: false,
+          outputFacialTransformationMatrixes: false
+        });
+
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+        log(`Face Landmarker initialized successfully in ${elapsed}s`);
+
+        window.parent.postMessage({
+          type: 'MEDIAPIPE_READY',
+          success: true
+        }, '*');
+
+        return true;
+      } catch (error) {
+        log(`Initialization failed: ${error.message}`, true);
+        log(`Stack: ${error.stack}`, true);
+
+        window.parent.postMessage({
+          type: 'MEDIAPIPE_READY',
+          success: false,
+          error: error.message
+        }, '*');
+
+        return false;
+      }
+    }
+
+    // Process video frame
+    function processFrame() {
+      if (!isRunning || !faceLandmarker || !videoElement) return;
+
+      const now = performance.now();
+
+      if (videoElement.readyState >= 2) {
+        try {
+          const results = faceLandmarker.detectForVideo(videoElement, now);
+
+          if (results && results.faceLandmarks && results.faceLandmarks.length > 0) {
+            const landmarks = results.faceLandmarks[0];
+
+            // Extract iris positions
+            const leftIris = {
+              x: landmarks[468].x,
+              y: landmarks[468].y
+            };
+            const rightIris = {
+              x: landmarks[473].x,
+              y: landmarks[473].y
+            };
+
+            // Use FACE VERTICAL POSITION for Y-axis (nose tip Y coordinate)
+            // When looking up: nose moves UP in frame (smaller Y)
+            // When looking down: nose moves DOWN in frame (larger Y)
+            const noseTip = landmarks[1];  // Nose tip
+            const faceY = noseTip.y;
+
+            // Send to parent
+            window.parent.postMessage({
+              type: 'GAZE_DATA',
+              data: {
+                leftIris,
+                rightIris,
+                landmarks: landmarks.slice(0, 478).map(l => ({ x: l.x, y: l.y })),
+                faceY,  // Nose Y position for vertical gaze
+                timestamp: now
+              }
+            }, '*');
+          }
+
+          lastFrameTime = now;
+        } catch (error) {
+          log(`Frame processing error: ${error.message}`, true);
+        }
+      }
+
+      animationFrameId = requestAnimationFrame(processFrame);
+    }
+
+    // Start tracking
+    function startTracking() {
+      if (!faceLandmarker) {
+        log('Cannot start: MediaPipe not initialized', true);
+        return;
+      }
+
+      if (!videoElement || !videoElement.srcObject) {
+        log('Cannot start: No video stream', true);
+        return;
+      }
+
+      if (isRunning) {
+        log('Already running');
+        return;
+      }
+
+      isRunning = true;
+      lastFrameTime = performance.now();
+      processFrame();
+      log('Tracking started');
+    }
+
+    // Stop tracking
+    function stopTracking() {
+      isRunning = false;
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
+        animationFrameId = null;
+      }
+      log('Tracking stopped');
+    }
+
+    // Canvas for receiving frames from parent
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = 640;
+    canvas.height = 480;
+
+    // Process canvas frames
+    let frameCount = 0;
+    let lastLogTime = 0;
+
+    /**
+     * IMPROVED PUPIL DETECTION
+     * Uses proper thresholding + contour detection to find circular pupil
+     * NOT just darkest point which could be eyelash/shadow
+     */
+    function detectPupilWithOpenCV(eyeROI) {
+      if (!cv) return null;
+
+      const gray = new cv.Mat();
+      const blurred = new cv.Mat();
+      const thresh = new cv.Mat();
+      const contours = new cv.MatVector();
+      const hierarchy = new cv.Mat();
+
+      try {
+        // 1. Convert to grayscale
+        cv.cvtColor(eyeROI, gray, cv.COLOR_RGBA2GRAY, 0);
+
+        // 2. Blur to reduce noise
+        cv.GaussianBlur(gray, blurred, new cv.Size(3, 3), 0); // Reduced blur
+
+        // 3. Adaptive thresholding to find dark regions
+        // More aggressive settings to better detect pupil
+        cv.adaptiveThreshold(
+          blurred,
+          thresh,
+          255,
+          cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+          cv.THRESH_BINARY_INV, // INV = dark regions become white
+          15,  // Increased block size for better detection
+          3    // Increased constant for more aggressive threshold
+        );
+
+        // 4. Morphological operations - lighter touch to preserve pupil shape
+        const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(2, 2));
+        cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel); // Fill small holes only
+        kernel.delete();
+
+        // 5. Find contours
+        cv.findContours(
+          thresh,
+          contours,
+          hierarchy,
+          cv.RETR_EXTERNAL,
+          cv.CHAIN_APPROX_SIMPLE
+        );
+
+        // 6. Find best circular contour (pupil is circular)
+        let bestPupil = null;
+        let bestCircularity = 0;
+
+        for (let i = 0; i < contours.size(); i++) {
+          const contour = contours.get(i);
+          const area = cv.contourArea(contour);
+
+          // Filter by size: pupil should be 2-60% of eye region (very relaxed)
+          const minArea = (eyeROI.cols * eyeROI.rows) * 0.02; // Further reduced
+          const maxArea = (eyeROI.cols * eyeROI.rows) * 0.60; // Further increased
+
+          if (area < minArea || area > maxArea) {
+            continue;
+          }
+
+          // Check circularity: 4π*area / perimeter²
+          const perimeter = cv.arcLength(contour, true);
+          const circularity = (4 * Math.PI * area) / (perimeter * perimeter);
+
+          // Pupil should be somewhat circular (very relaxed - 0.3)
+          if (circularity > 0.3 && circularity > bestCircularity) {
+            // Get center using moments
+            const moments = cv.moments(contour);
+            const center = {
+              x: moments.m10 / moments.m00,
+              y: moments.m01 / moments.m00
+            };
+
+            // Validate: center should not be at extreme edges
+            const margin = eyeROI.cols * 0.05; // Reduced to 5% margin
+            if (center.x > margin &&
+                center.x < eyeROI.cols - margin &&
+                center.y > margin &&
+                center.y < eyeROI.rows - margin &&
+                !isNaN(center.x) && !isNaN(center.y)) {
+
+              bestCircularity = circularity;
+              const radius = Math.sqrt(area / Math.PI);
+              bestPupil = { center, radius, circularity, area };
+            }
+          }
+        }
+
+        // Debug logging
+        if (frameCount % 100 === 0) {
+          if (bestPupil) {
+            log(`✅ Pupil found: center=(${bestPupil.center.x.toFixed(0)}, ${bestPupil.center.y.toFixed(0)}), r=${bestPupil.radius.toFixed(0)}, circ=${bestPupil.circularity.toFixed(2)} in ${eyeROI.cols}x${eyeROI.rows}`);
+          } else {
+            log(`❌ No valid pupil found (${contours.size()} contours checked) in ${eyeROI.cols}x${eyeROI.rows}`, true);
+          }
+        }
+
+        return bestPupil;
+
+      } catch (error) {
+        log(`OpenCV pupil detection error: ${error.message}`, true);
+        return null;
+      } finally {
+        // CRITICAL: Clean up all Mats to prevent memory leak
+        gray.delete();
+        blurred.delete();
+        thresh.delete();
+        contours.delete();
+        hierarchy.delete();
+      }
+    }
+
+    /**
+     * Extract eye region from frame using MediaPipe landmarks
+     */
+    function extractEyeRegion(imageData, landmarks, eye) {
+      if (!cv) return null;
+
+      try {
+        // Eye landmark indices
+        // Left eye: 33, 133, 160, 144, 153, 145
+        // Right eye: 362, 263, 385, 373, 380, 374
+        const leftEyeIndices = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246];
+        const rightEyeIndices = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398];
+
+        const indices = eye === 'left' ? leftEyeIndices : rightEyeIndices;
+
+        // Find bounding box
+        let minX = 1, maxX = 0, minY = 1, maxY = 0;
+        indices.forEach(idx => {
+          const lm = landmarks[idx];
+          minX = Math.min(minX, lm.x);
+          maxX = Math.max(maxX, lm.x);
+          minY = Math.min(minY, lm.y);
+          maxY = Math.max(maxY, lm.y);
+        });
+
+        // Add MASSIVE padding - eye landmarks are too tight
+        const padding = 1.2; // Even more padding to capture full eye
+        const width = maxX - minX;
+        const height = maxY - minY;
+        minX = Math.max(0, minX - width * padding);
+        maxX = Math.min(1, maxX + width * padding);
+        minY = Math.max(0, minY - height * padding);
+        maxY = Math.min(1, maxY + height * padding);
+
+        // Convert to pixel coordinates
+        let x = Math.floor(minX * imageData.width);
+        let y = Math.floor(minY * imageData.height);
+        let w = Math.floor((maxX - minX) * imageData.width);
+        let h = Math.floor((maxY - minY) * imageData.height);
+
+        // CRITICAL: Ensure minimum size for pupil detection
+        const MIN_WIDTH = 160;  // Increased to 160px
+        const MIN_HEIGHT = 100;  // Increased to 100px
+
+        if (w < MIN_WIDTH || h < MIN_HEIGHT) {
+          // Expand region to minimum size
+          const centerX = x + w / 2;
+          const centerY = y + h / 2;
+          w = Math.max(w, MIN_WIDTH);
+          h = Math.max(h, MIN_HEIGHT);
+          x = Math.max(0, Math.floor(centerX - w / 2));
+          y = Math.max(0, Math.floor(centerY - h / 2));
+
+          // Clamp to image bounds
+          if (x + w > imageData.width) x = imageData.width - w;
+          if (y + h > imageData.height) y = imageData.height - h;
+
+          if (frameCount % 100 === 0) {
+            log(`${eye} eye region expanded to ${w}x${h} (was too small)`);
+          }
+        }
+
+        // Extract region using canvas
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = w;
+        tempCanvas.height = h;
+        const tempCtx = tempCanvas.getContext('2d');
+
+        // Put full image on temp canvas
+        const fullCanvas = document.createElement('canvas');
+        fullCanvas.width = imageData.width;
+        fullCanvas.height = imageData.height;
+        const fullCtx = fullCanvas.getContext('2d');
+        fullCtx.putImageData(imageData, 0, 0);
+
+        // Extract region
+        tempCtx.drawImage(fullCanvas, x, y, w, h, 0, 0, w, h);
+        const regionData = tempCtx.getImageData(0, 0, w, h);
+
+        // Convert to OpenCV Mat
+        return {
+          mat: cv.matFromImageData(regionData),
+          bounds: { x, y, w, h, minX, minY }
+        };
+      } catch (error) {
+        log(`Eye region extraction error: ${error.message}`, true);
+        return null;
+      }
+    }
+
+    function processCanvasFrame(imageData) {
+      if (!faceLandmarker || !isRunning) {
+        log(`Not processing: faceLandmarker=${!!faceLandmarker}, isRunning=${isRunning}`, true);
+        return;
+      }
+
+      try {
+        frameCount++;
+        const now = performance.now();
+
+        // Put image data on canvas
+        ctx.putImageData(imageData, 0, 0);
+
+        const results = faceLandmarker.detectForVideo(canvas, now);
+
+        // Log every 30 frames (about once per second)
+        if (frameCount % 30 === 0 || now - lastLogTime > 2000) {
+          if (results && results.faceLandmarks && results.faceLandmarks.length > 0) {
+            log(`✅ Face detected! Landmarks: ${results.faceLandmarks[0].length}`);
+          } else {
+            log(`⚠️ No face detected (frame ${frameCount})`, true);
+          }
+          lastLogTime = now;
+        }
+
+        if (results && results.faceLandmarks && results.faceLandmarks.length > 0) {
+          const landmarks = results.faceLandmarks[0];
+
+          // Always use the reliable MediaPipe iris landmarks
+          const leftIris = {
+            x: landmarks[468].x,
+            y: landmarks[468].y
+          };
+          const rightIris = {
+            x: landmarks[473].x,
+            y: landmarks[473].y
+          };
+
+          if (frameCount === 1) {
+            log(`✅ Sending first GAZE_DATA: iris=(${leftIris.x.toFixed(2)}, ${leftIris.y.toFixed(2)})`);
+          }
+
+          // Send raw, consistent data to parent
+          window.parent.postMessage({
+            type: 'GAZE_DATA',
+            data: {
+              leftIris,
+              rightIris,
+              landmarks: landmarks.slice(0, 478).map(l => ({ x: l.x, y: l.y })),
+              timestamp: now
+            }
+          }, '*');
+        }
+      } catch (error) {
+        log(`Canvas frame processing error: ${error.message}`, true);
+        log(`Error stack: ${error.stack}`, true);
+      }
+    }
+
+    // Handle messages from parent
+    window.addEventListener('message', async (event) => {
+      const { type, data } = event.data;
+
+      switch (type) {
+        case 'INIT_MEDIAPIPE':
+          log('Received INIT_MEDIAPIPE command');
+          await loadOpenCV();
+          await loadMediaPipe();
+          await initializeMediaPipe();
+          break;
+
+        case 'VIDEO_READY':
+          log('Video ready in parent');
+          videoElement = document.getElementById('video');
+          break;
+
+        case 'VIDEO_FRAME':
+          // Receive video frame from parent as ImageData
+          if (frameCount === 0) {
+            log('✅ First VIDEO_FRAME received');
+          }
+          if (data && data.imageData) {
+            processCanvasFrame(data.imageData);
+          } else {
+            if (frameCount < 10) {
+              log('⚠️ VIDEO_FRAME without imageData', true);
+            }
+          }
+          break;
+
+        case 'START_TRACKING':
+          log('Received START_TRACKING command');
+          isRunning = true;
+          log('Tracking started - waiting for frames');
+          break;
+
+        case 'STOP_TRACKING':
+          log('Received STOP_TRACKING command');
+          stopTracking();
+          break;
+
+        default:
+          log(`Unknown message type: ${type}`);
+      }
+    });
+
+    // Notify parent that sandbox is ready
+    log('Sandbox ready, waiting for commands');
+    window.parent.postMessage({
+      type: 'SANDBOX_READY'
+    }, '*');
+  </script>
+</body>
+</html>

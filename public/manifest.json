@@ -26,21 +26,33 @@
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_end"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["assets/*", "icons/*"],
-      "matches": ["<all_urls>"]
+      "resources": [
+        "assets/*",
+        "libs/*",
+        "libs/mediapipe/*",
+        "libs/mediapipe/wasm/*",
+        "icons/*",
+        "sandbox.html"
+      ],
+      "matches": ["<all_urls>"],
+      "use_dynamic_url": true
     }
   ],
+  "sandbox": {
+    "pages": ["sandbox.html"]
+  },
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'",
+    "sandbox": "sandbox allow-scripts allow-forms; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https://cdn.jsdelivr.net https://storage.googleapis.com https://docs.opencv.org; child-src 'self'"
   }
 }

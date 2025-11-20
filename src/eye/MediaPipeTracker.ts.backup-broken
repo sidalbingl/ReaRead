@@ -1,0 +1,417 @@
+/**
+ * MediaPipe-based Eye Tracking Module (Sandbox Edition)
+ *
+ * Uses sandbox iframe to bypass Chrome Extension CSP restrictions
+ * MediaPipe runs in sandbox, gaze data sent via postMessage
+ */
+
+import { KalmanFilter } from '../utils/KalmanFilter';
+import { SandboxBridge, type SandboxGazeData } from './SandboxBridge';
+
+export interface GazePoint {
+  x: number;
+  y: number;
+  rawX: number;  // Raw uncalibrated X coordinate (before calibration)
+  rawY: number;  // Raw uncalibrated Y coordinate (before calibration)
+  timestamp: number;
+  confidence: number;
+  velocity?: { vx: number; vy: number };
+}
+
+export interface MediaPipeConfig {
+  onGazeUpdate?: (gaze: GazePoint) => void;
+  onError?: (error: Error) => void;
+  videoElement: HTMLVideoElement;
+  debugMode?: boolean;
+}
+
+export class MediaPipeTracker {
+  private sandboxBridge: SandboxBridge | null = null;
+  private kalmanFilter: KalmanFilter;
+  private config: MediaPipeConfig;
+  private isRunning = false;
+  private mediaStream: MediaStream | null = null;
+
+  // Calibration offset (will be adjusted during calibration)
+  private calibrationOffset = { x: 0, y: 0 };
+  private calibrationScale = { x: 1, y: 1 };
+
+  // Debug flags
+  private hasReceivedFirstGaze = false;
+  private hasCalledGazeUpdate = false;
+  private hasLoggedRawIris = false;
+  private hasLoggedCalculatedGaze = false;
+
+  constructor(config: MediaPipeConfig) {
+    this.config = config;
+    this.kalmanFilter = new KalmanFilter();
+  }
+
+  /**
+   * Initialize MediaPipe via Sandbox
+   */
+  async initialize(): Promise<void> {
+    try {
+      console.log('[MediaPipe] Initializing via sandbox...');
+
+      // Get video stream from video element
+      if (this.config.videoElement && this.config.videoElement.srcObject) {
+        this.mediaStream = this.config.videoElement.srcObject as MediaStream;
+      }
+
+      // Create sandbox bridge
+      this.sandboxBridge = new SandboxBridge({
+        onGazeData: (data) => this.handleGazeData(data),
+        onReady: () => {
+          console.log('[MediaPipe] ✅ Sandbox ready');
+        },
+        onError: (error) => {
+          console.error('[MediaPipe] Sandbox error:', error);
+          this.config.onError?.(error);
+        },
+        debugMode: this.config.debugMode
+      });
+
+      // Initialize sandbox
+      await this.sandboxBridge.initialize();
+
+      console.log('[MediaPipe] ✅ Initialized via sandbox');
+    } catch (error) {
+      console.error('[MediaPipe] Initialization failed:', error);
+      this.config.onError?.(error as Error);
+      throw error;
+    }
+  }
+
+  /**
+   * Start tracking from video stream
+   */
+  async start(): Promise<void> {
+    if (!this.sandboxBridge) {
+      throw new Error('MediaPipe not initialized. Call initialize() first.');
+    }
+
+    if (this.isRunning) {
+      console.warn('[MediaPipe] Already running');
+      return;
+    }
+
+    // Set video stream in sandbox
+    if (this.mediaStream) {
+      await this.sandboxBridge.setVideoStream(this.mediaStream);
+    }
+
+    this.isRunning = true;
+    await this.sandboxBridge.start();
+
+    console.log('[MediaPipe] ✅ Tracking started');
+  }
+
+  /**
+   * Stop tracking
+   */
+  stop(): void {
+    this.isRunning = false;
+
+    if (this.sandboxBridge) {
+      this.sandboxBridge.stop();
+    }
+
+    console.log('[MediaPipe] Tracking stopped');
+  }
+
+  // Frame counter for periodic logging
+  private frameCount = 0;
+
+  /**
+   * Handle gaze data from sandbox
+   */
+  private handleGazeData(data: SandboxGazeData): void {
+    if (!this.isRunning) {
+      console.warn('[MediaPipe] handleGazeData called but isRunning=false');
+      return;
+    }
+
+    this.frameCount++;
+
+    // Debug: Log first gaze data received
+    if (this.config.debugMode && !this.hasReceivedFirstGaze) {
+      console.log('[MediaPipe] ✅ First GAZE_DATA received in tracker');
+      this.hasReceivedFirstGaze = true;
+    }
+
+    // Log every 100 frames
+    if (this.frameCount % 100 === 0) {
+      console.log(`[MediaPipe] Processing frame ${this.frameCount}`);
+    }
+
+    try {
+      const gaze = this.estimateGaze(data);
+
+      if (gaze) {
+        // Save raw uncalibrated coordinates BEFORE Kalman filter
+        const rawX = gaze.rawX;
+        const rawY = gaze.rawY;
+
+        // Apply Kalman filter to calibrated coordinates
+        const now = performance.now();
+        const dt = 0.033; // ~30 FPS
+        this.kalmanFilter.predict(dt);
+        this.kalmanFilter.update(gaze.x, gaze.y);
+
+        const filtered = this.kalmanFilter.getPosition();
+        const velocity = this.kalmanFilter.getVelocity();
+
+        const gazePoint: GazePoint = {
+          x: filtered.x,
+          y: filtered.y,
+          rawX: rawX,  // Use saved raw coordinates (before Kalman)
+          rawY: rawY,  // Use saved raw coordinates (before Kalman)
+          timestamp: now,
+          confidence: gaze.confidence,
+          velocity
+        };
+
+        // Debug: Log first gaze update callback
+        if (this.config.debugMode && !this.hasCalledGazeUpdate) {
+          console.log('[MediaPipe] ✅ Calling onGazeUpdate with:', gazePoint.x.toFixed(0), gazePoint.y.toFixed(0));
+          console.log('[MediaPipe] Raw coordinates:', rawX.toFixed(0), rawY.toFixed(0));
+          this.hasCalledGazeUpdate = true;
+        }
+
+        this.config.onGazeUpdate?.(gazePoint);
+      } else {
+        if (this.config.debugMode) {
+          console.warn('[MediaPipe] estimateGaze returned null');
+        }
+      }
+    } catch (error) {
+      console.error('[MediaPipe] Gaze processing error:', error);
+    }
+  }
+
+  /**
+   * Estimate gaze position from iris landmarks
+   * Data comes from sandbox
+   */
+  private estimateGaze(data: SandboxGazeData): GazePoint | null {
+    const { leftIris, rightIris, landmarks } = data;
+
+    if (!landmarks || landmarks.length < 468) {
+      if (this.config.debugMode) {
+        console.warn('[MediaPipe] Invalid landmarks:', landmarks?.length || 0);
+      }
+      return null;
+    }
+
+    // Validate iris data
+    if (!leftIris || !rightIris || !leftIris.x || !rightIris.x) {
+      if (this.config.debugMode) {
+        console.warn('[MediaPipe] Invalid iris data:', { leftIris, rightIris });
+      }
+      return null;
+    }
+
+    // Debug: Log raw iris data (first time only)
+    if (this.config.debugMode && !this.hasLoggedRawIris) {
+      console.log('[MediaPipe] Raw iris data:', {
+        leftIris,
+        rightIris,
+        landmark33: landmarks[33],
+        landmark468: landmarks[468],
+        landmarksLength: landmarks.length
+      });
+      this.hasLoggedRawIris = true;
+    }
+
+    // Get eye landmarks for offset calculation
+    const leftEyeLeft = landmarks[33];      // Left corner of left eye
+    const leftEyeRight = landmarks[133];    // Right corner of left eye
+    const leftEyeTop = landmarks[159];      // Top of left eye
+    const leftEyeBottom = landmarks[145];   // Bottom of left eye
+    const rightEyeLeft = landmarks[362];    // Left corner of right eye
+    const rightEyeRight = landmarks[263];   // Right corner of right eye
+    const rightEyeTop = landmarks[386];     // Top of right eye
+    const rightEyeBottom = landmarks[374];  // Bottom of right eye
+
+    // Validate all required landmarks exist
+    if (!leftEyeLeft || !leftEyeRight || !leftEyeTop || !leftEyeBottom ||
+        !rightEyeLeft || !rightEyeRight || !rightEyeTop || !rightEyeBottom) {
+      if (this.config.debugMode) {
+        console.warn('[MediaPipe] Missing eye landmarks');
+      }
+      return null;
+    }
+
+    // Calculate eye dimensions
+    const leftEyeWidth = Math.abs(leftEyeRight.x - leftEyeLeft.x);
+    const leftEyeHeight = Math.abs(leftEyeBottom.y - leftEyeTop.y);
+    const rightEyeWidth = Math.abs(rightEyeRight.x - rightEyeLeft.x);
+    const rightEyeHeight = Math.abs(rightEyeBottom.y - rightEyeTop.y);
+
+    // Map to screen coordinates
+    const screenWidth = window.innerWidth;
+    const screenHeight = window.innerHeight;
+
+    // Calculate eye centers
+    const leftEyeCenterX = (leftEyeLeft.x + leftEyeRight.x) / 2;
+    const leftEyeCenterY = (leftEyeTop.y + leftEyeBottom.y) / 2;
+    const rightEyeCenterX = (rightEyeLeft.x + rightEyeRight.x) / 2;
+    const rightEyeCenterY = (rightEyeTop.y + rightEyeBottom.y) / 2;
+
+    // Calculate iris offset from eye center (normalized by eye size)
+    // X: normal (iris - center) - right is positive
+    // Y: flipped (center - iris) - up is positive (because MediaPipe Y increases downward)
+    const leftIrisOffsetX = (leftIris.x - leftEyeCenterX) / (leftEyeWidth / 2);
+    const leftIrisOffsetY = (leftEyeCenterY - leftIris.y) / (leftEyeHeight / 2);
+    const rightIrisOffsetX = (rightIris.x - rightEyeCenterX) / (rightEyeWidth / 2);
+    const rightIrisOffsetY = (rightEyeCenterY - rightIris.y) / (rightEyeHeight / 2);
+
+    // Average both eyes
+    const avgIrisOffsetX = (leftIrisOffsetX + rightIrisOffsetX) / 2;
+    const avgIrisOffsetY = (leftIrisOffsetY + rightIrisOffsetY) / 2;
+
+    // Map iris offset to screen: start from center, apply offset
+    // offset is in range roughly -1 to 1, multiply by screen size and sensitivity
+    // FLIP X because camera is mirrored (looking right in real life = iris left in camera)
+    const sensitivity = 2.0;  // Increased sensitivity for better range coverage
+    const baseX = screenWidth / 2 + (-avgIrisOffsetX * sensitivity * screenWidth / 2);  // Flip X for mirror
+    const baseY = screenHeight / 2 + (avgIrisOffsetY * sensitivity * screenHeight / 2);
+
+    // Apply calibration: calibrated = (base - offsetBase) * scale + offsetTarget
+    // Where calibration determines the transformation from base space to screen space
+    let gazeX = baseX * this.calibrationScale.x + this.calibrationOffset.x;
+    let gazeY = baseY * this.calibrationScale.y + this.calibrationOffset.y;
+
+    // Clamp to screen boundaries AFTER calibration
+    gazeX = Math.max(0, Math.min(screenWidth, gazeX));
+    gazeY = Math.max(0, Math.min(screenHeight, gazeY));
+
+    // Confidence based on eye detection quality
+    const eyeSizeVariation = Math.abs(leftEyeWidth - rightEyeWidth) / ((leftEyeWidth + rightEyeWidth) / 2);
+    const confidence = Math.max(0.5, 1.0 - eyeSizeVariation);
+
+    // Debug: Log calculated gaze (first time only)
+    if (this.config.debugMode && !this.hasLoggedCalculatedGaze) {
+      console.log('[MediaPipe] Gaze calculation:', {
+        avgIrisOffsetX: avgIrisOffsetX.toFixed(3),
+        avgIrisOffsetY: avgIrisOffsetY.toFixed(3),
+        sensitivity,
+        baseX: baseX.toFixed(0),
+        baseY: baseY.toFixed(0),
+        baseXRange: `${(screenWidth/2 - sensitivity*screenWidth/2).toFixed(0)} to ${(screenWidth/2 + sensitivity*screenWidth/2).toFixed(0)}`,
+        calibrationScale: this.calibrationScale,
+        calibrationOffset: this.calibrationOffset,
+        gazeX: gazeX.toFixed(0),
+        gazeY: gazeY.toFixed(0),
+        screenWidth,
+        screenHeight
+      });
+      this.hasLoggedCalculatedGaze = true;
+    }
+
+    return {
+      x: gazeX,
+      y: gazeY,
+      rawX: baseX,  // Raw uncalibrated coordinate for calibration
+      rawY: baseY,  // Raw uncalibrated coordinate for calibration
+      timestamp: performance.now(),
+      confidence
+    };
+  }
+
+  /**
+   * Apply calibration data
+   * Uses polynomial transformation for better accuracy
+   */
+  applyCalibration(points: Array<{ actual: { x: number; y: number }, measured: { x: number; y: number } }>): void {
+    if (points.length === 0) return;
+
+    console.log('[MediaPipe] Applying calibration with', points.length, 'points');
+
+    // DEBUG: Log first 5 calibration points to see the data
+    console.log('[MediaPipe] Sample calibration points:');
+    for (let i = 0; i < Math.min(5, points.length); i++) {
+      const p = points[i];
+      console.log(`  Point ${i+1}: actual=(${p.actual.x.toFixed(0)}, ${p.actual.y.toFixed(0)}) measured=(${p.measured.x.toFixed(0)}, ${p.measured.y.toFixed(0)})`);
+    }
+
+    // Use linear regression: actual = scale * measured + offset
+    // This minimizes the error across all calibration points
+
+    // Calculate means
+    let meanActualX = 0, meanActualY = 0;
+    let meanMeasuredX = 0, meanMeasuredY = 0;
+
+    points.forEach(p => {
+      meanActualX += p.actual.x;
+      meanActualY += p.actual.y;
+      meanMeasuredX += p.measured.x;
+      meanMeasuredY += p.measured.y;
+    });
+
+    meanActualX /= points.length;
+    meanActualY /= points.length;
+    meanMeasuredX /= points.length;
+    meanMeasuredY /= points.length;
+
+    // Calculate scale using least squares
+    let numeratorX = 0, denominatorX = 0;
+    let numeratorY = 0, denominatorY = 0;
+
+    points.forEach(p => {
+      const dx = p.measured.x - meanMeasuredX;
+      const dy = p.measured.y - meanMeasuredY;
+
+      numeratorX += dx * (p.actual.x - meanActualX);
+      denominatorX += dx * dx;
+
+      numeratorY += dy * (p.actual.y - meanActualY);
+      denominatorY += dy * dy;
+    });
+
+    const scaleX = denominatorX !== 0 ? numeratorX / denominatorX : 1.0;
+    const scaleY = denominatorY !== 0 ? numeratorY / denominatorY : 1.0;
+
+    // Calculate offset: offset = mean(actual) - scale * mean(measured)
+    const offsetX = meanActualX - scaleX * meanMeasuredX;
+    const offsetY = meanActualY - scaleY * meanMeasuredY;
+
+    this.calibrationScale = { x: scaleX, y: scaleY };
+    this.calibrationOffset = { x: offsetX, y: offsetY };
+
+    // Log calibration quality - apply the calibration transform to measured values
+    const errors = points.map(p => {
+      // Estimate the gaze position using the calculated calibration
+      const estimatedX = scaleX * p.measured.x + offsetX;
+      const estimatedY = scaleY * p.measured.y + offsetY;
+
+      // Calculate error as distance from actual target
+      const dx = p.actual.x - estimatedX;
+      const dy = p.actual.y - estimatedY;
+      return Math.sqrt(dx * dx + dy * dy);
+    });
+    const avgError = errors.reduce((a, b) => a + b, 0) / errors.length;
+
+    console.log('[MediaPipe] Calibration applied:');
+    console.log('  Offset:', this.calibrationOffset.x.toFixed(0), this.calibrationOffset.y.toFixed(0));
+    console.log('  Scale:', this.calibrationScale.x.toFixed(2), this.calibrationScale.y.toFixed(2));
+    console.log('  Avg error:', avgError.toFixed(0), 'px');
+  }
+
+  /**
+   * Cleanup resources
+   */
+  async dispose(): Promise<void> {
+    this.stop();
+
+    if (this.sandboxBridge) {
+      this.sandboxBridge.dispose();
+      this.sandboxBridge = null;
+    }
+
+    this.mediaStream = null;
+
+    console.log('[MediaPipe] Disposed');
+  }
+}

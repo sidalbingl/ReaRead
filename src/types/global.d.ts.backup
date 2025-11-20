@@ -1,0 +1,26 @@
+// WebGazer.js type definitions
+declare namespace WebGazer {
+  interface GazeData {
+    x: number;
+    y: number;
+    // Add other properties as needed
+  }
+
+  interface WebGazer {
+    begin: () => Promise<void>;
+    pause: () => void;
+    resume: () => void;
+    end: () => Promise<void>;
+    getCurrentPrediction: () => Promise<GazeData | null>;
+    setGazeListener: (callback: (data: GazeData | null, elapsedTime: number) => void) => void;
+    // Add other methods as needed
+  }
+}
+
+declare global {
+  interface Window {
+    webgazer: WebGazer.WebGazer;
+  }
+}
+
+export {};

@@ -1,0 +1,672 @@
+/**
+ * ReaRead Content Script (MediaPipe Edition)
+ *
+ * Eye tracking powered by MediaPipe + Kalman Filter
+ * Hierarchical region tracking: Line → Phrase → Word
+ * Context-aware word inference
+ */
+
+import { MediaPipeTracker, GazePoint } from '../eye/MediaPipeTracker';
+import { CalibrationSystem } from '../eye/CalibrationSystem';
+import { RegionTracker } from '../ml/RegionTracker';
+import { WordInference } from '../ml/WordInference';
+
+// ========================================
+// STATE MANAGEMENT
+// ========================================
+
+let stream: MediaStream | null = null;
+let tracker: MediaPipeTracker | null = null;
+let calibration: CalibrationSystem | null = null;
+let regionTracker: RegionTracker | null = null;
+let wordInference: WordInference | null = null;
+
+let isActive = false;
+let isCalibrated = false;
+
+// UI Elements
+let overlayRoot: HTMLDivElement | null = null;
+let statusBadge: HTMLDivElement | null = null;
+let videoEl: HTMLVideoElement | null = null;
+let gazeIndicator: HTMLDivElement | null = null;
+let analyticsPanel: HTMLDivElement | null = null;
+
+// Analytics
+let totalFixations = 0;
+let totalSaccades = 0;
+let sessionStartTime = 0;
+
+// Reading behavior tracking
+let currentGaze: GazePoint | null = null;
+let fixationStartTime = 0;
+let fixationStartPos: { x: number; y: number } | null = null;
+let isFixating = false;
+
+const FIXATION_THRESHOLD = 150; // ms - minimum duration to be considered a fixation
+const FIXATION_DISTANCE = 50; // px - maximum movement radius to be considered a fixation
+
+// ========================================
+// INITIALIZATION
+// ========================================
+
+async function startCamera(): Promise<void> {
+  if (isActive) return;
+
+  try {
+    console.log('[ReaRead] Starting camera...');
+
+    ensureOverlay();
+
+    // Request camera access
+    const constraints = {
+      video: {
+        facingMode: 'user',
+        width: { ideal: 640 },
+        height: { ideal: 480 }
+      }
+    };
+
+    console.log('[ReaRead] Requesting camera access...');
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+    console.log('[ReaRead] ✅ Camera access granted');
+
+    // Setup video element and wait for it to be ready
+    if (!videoEl) {
+      throw new Error('Video element not created');
+    }
+
+    videoEl.srcObject = stream;
+
+    // Wait for video to be loaded and playing
+    await new Promise<void>((resolve, reject) => {
+      if (!videoEl) {
+        reject(new Error('Video element is null'));
+        return;
+      }
+
+      const onLoadedMetadata = () => {
+        console.log('[ReaRead] Video metadata loaded');
+        videoEl?.play()
+          .then(() => {
+            console.log('[ReaRead] Video playing');
+            resolve();
+          })
+          .catch(reject);
+      };
+
+      const onError = (e: Event) => {
+        reject(new Error(`Video load error: ${e.type}`));
+      };
+
+      videoEl.addEventListener('loadedmetadata', onLoadedMetadata, { once: true });
+      videoEl.addEventListener('error', onError, { once: true });
+
+      // Timeout after 5 seconds
+      setTimeout(() => {
+        reject(new Error('Video load timeout'));
+      }, 5000);
+    });
+
+    console.log('[ReaRead] Video ready, initializing modules...');
+
+    // Initialize modules
+    await initializeModules();
+
+    isActive = true;
+    console.log('[ReaRead] ✅ Camera started');
+
+  } catch (error) {
+    console.error('[ReaRead] Camera error:', error);
+
+    // Clean up stream on error
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      stream = null;
+    }
+
+    if (statusBadge) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      statusBadge.textContent = `ReaRead • Error: ${errorMessage}`;
+      statusBadge.style.background = 'rgba(239,68,68,.95)';
+    }
+
+    throw error;
+  }
+}
+
+async function initializeModules(): Promise<void> {
+  console.log('[ReaRead] Initializing modules...');
+
+  // Initialize calibration system
+  calibration = new CalibrationSystem();
+
+  // Initialize MediaPipe tracker
+  if (!videoEl) {
+    throw new Error('Video element not ready');
+  }
+
+  tracker = new MediaPipeTracker({
+    videoElement: videoEl,
+    onGazeUpdate: handleGazeUpdate,
+    onError: (error) => {
+      console.error('[ReaRead] Tracker error:', error);
+    },
+    debugMode: true // Enable debug logging
+  });
+
+  await tracker.initialize();
+
+  // Initialize region tracker
+  regionTracker = new RegionTracker();
+  regionTracker.scanPage();
+
+  // Re-scan periodically (for dynamic content)
+  setInterval(() => {
+    if (isActive && regionTracker) {
+      regionTracker.scanPage();
+    }
+  }, 5000);
+
+  // Initialize word inference
+  wordInference = new WordInference();
+
+  // Check for saved calibration
+  const savedCalibration = await calibration.loadCalibration();
+
+  if (savedCalibration) {
+    console.log('[ReaRead] Using saved calibration');
+    isCalibrated = true;
+
+    if (statusBadge) {
+      statusBadge.textContent = 'ReaRead • Active ✓';
+      statusBadge.style.background = 'rgba(16,185,129,.95)';
+    }
+
+    createAnalyticsPanel();
+    createGazeIndicator();
+
+    await tracker.start();
+
+  } else {
+    console.log('[ReaRead] Running calibration...');
+
+    if (statusBadge) {
+      statusBadge.textContent = 'ReaRead • Calibrating...';
+      statusBadge.style.background = 'rgba(251,191,36,.95)';
+    }
+
+    // Start tracker first
+    await tracker.start();
+
+    // Wait a moment for tracker to stabilize
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    // Run calibration (without gaze indicator to avoid distraction)
+    await runCalibration();
+
+    // Create UI elements AFTER calibration is complete
+    createGazeIndicator();
+    createAnalyticsPanel();
+  }
+  sessionStartTime = Date.now();
+}
+
+async function runCalibration(): Promise<void> {
+  if (!calibration || !tracker) return;
+
+  try {
+    const calibrationPoints: Array<{ actual: { x: number; y: number }, measured: { x: number; y: number } }> = [];
+
+    await calibration.runExplicitCalibration(async (targetPoint) => {
+      console.log('[ReaRead] Calibrating at point:', targetPoint.x, targetPoint.y);
+
+      // Capture gaze at this point
+      return new Promise((resolve) => {
+        const samples: GazePoint[] = [];
+        const sampleCount = 10;
+        let collected = 0;
+
+        const interval = setInterval(() => {
+          if (currentGaze) {
+            samples.push(currentGaze);
+            collected++;
+          }
+
+          if (collected >= sampleCount) {
+            clearInterval(interval);
+
+            // Average the RAW samples (uncalibrated baseX/baseY)
+            const avgRawX = samples.reduce((sum, g) => sum + g.rawX, 0) / samples.length;
+            const avgRawY = samples.reduce((sum, g) => sum + g.rawY, 0) / samples.length;
+
+            // Store calibration data using RAW uncalibrated values
+            calibrationPoints.push({
+              actual: { x: targetPoint.x, y: targetPoint.y },
+              measured: { x: avgRawX, y: avgRawY }  // Use rawX/rawY instead of calibrated x/y
+            });
+
+            resolve({ x: avgRawX, y: avgRawY });
+          }
+        }, 50);
+      });
+    });
+
+    // Apply calibration to tracker
+    tracker.applyCalibration(calibrationPoints);
+    console.log('[ReaRead] ✅ Calibration data applied to tracker');
+
+    isCalibrated = true;
+
+    if (statusBadge) {
+      statusBadge.textContent = 'ReaRead • Active ✓';
+      statusBadge.style.background = 'rgba(16,185,129,.95)';
+    }
+
+    createAnalyticsPanel();
+    createGazeIndicator();
+
+    console.log('[ReaRead] ✅ Calibration complete');
+
+  } catch (error) {
+    console.error('[ReaRead] Calibration failed:', error);
+  }
+}
+
+function stopCamera(): void {
+  if (!isActive) return;
+
+  console.log('[ReaRead] Stopping camera...');
+
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+
+  if (tracker) {
+    tracker.stop();
+    tracker.dispose();
+    tracker = null;
+  }
+
+  isActive = false;
+  isCalibrated = false;
+
+  if (analyticsPanel) {
+    analyticsPanel.remove();
+    analyticsPanel = null;
+  }
+
+  if (gazeIndicator) {
+    gazeIndicator.remove();
+    gazeIndicator = null;
+  }
+
+  if (statusBadge) {
+    statusBadge.textContent = 'ReaRead • Tracking OFF';
+    statusBadge.style.background = 'rgba(107,114,128,.95)';
+  }
+
+  console.log('[ReaRead] ✅ Stopped');
+}
+
+// ========================================
+// GAZE PROCESSING
+// ========================================
+
+let gazeUpdateCount = 0;
+function handleGazeUpdate(gaze: GazePoint): void {
+  // Always update current gaze (needed for calibration)
+  currentGaze = gaze;
+
+  // Debug: Log first gaze update
+  gazeUpdateCount++;
+  if (gazeUpdateCount === 1) {
+    console.log('[ReaRead] ✅ First handleGazeUpdate called:', gaze.x.toFixed(0), gaze.y.toFixed(0));
+  }
+
+  // Update gaze indicator (only if it exists - created after calibration)
+  if (gazeIndicator) {
+    updateGazeIndicator(gaze.x, gaze.y);
+  }
+
+  // Debug: Log calibration status
+  if (gazeUpdateCount === 1) {
+    console.log('[ReaRead] Calibration status: isCalibrated=', isCalibrated);
+  }
+
+  // Only do region tracking after calibration
+  if (!isCalibrated || !regionTracker || !wordInference) return;
+
+  // Detect fixation
+  const isCurrentlyFixating = detectFixation(gaze);
+
+  if (isCurrentlyFixating && !isFixating) {
+    // Fixation started
+    isFixating = true;
+    fixationStartTime = gaze.timestamp;
+    // Don't increment totalFixations here - wait until fixation ends and is validated
+
+  } else if (!isCurrentlyFixating && isFixating) {
+    // Fixation ended
+    const fixationDuration = gaze.timestamp - fixationStartTime;
+
+    // Only count as fixation if it met the minimum duration
+    if (fixationDuration >= FIXATION_THRESHOLD) {
+      totalFixations++;
+      handleFixationEnd(gaze, fixationDuration);
+    }
+
+    isFixating = false;
+    totalSaccades++;
+  }
+
+  updateAnalytics();
+}
+
+function detectFixation(gaze: GazePoint): boolean {
+  // Fixation detection based on spatial proximity
+  if (!fixationStartPos) {
+    // Start a new potential fixation
+    fixationStartPos = { x: gaze.x, y: gaze.y };
+    fixationStartTime = gaze.timestamp;
+    return true;
+  }
+
+  // Calculate distance from fixation start position
+  const dx = gaze.x - fixationStartPos.x;
+  const dy = gaze.y - fixationStartPos.y;
+  const distance = Math.sqrt(dx * dx + dy * dy);
+
+  // If moved too far, this is a saccade (not a fixation)
+  if (distance > FIXATION_DISTANCE) {
+    // Start a new potential fixation at current position
+    fixationStartPos = { x: gaze.x, y: gaze.y };
+    fixationStartTime = gaze.timestamp;
+    return false;
+  }
+
+  // Still within fixation radius
+  return true;
+}
+
+function handleFixationEnd(gaze: GazePoint, duration: number): void {
+  // Note: duration check already done in caller, totalFixations already incremented
+
+  // Level 1: Detect line
+  const line = regionTracker!.detectLine(gaze.x, gaze.y);
+
+  if (line && line.confidence > 0.7) {
+    console.log(`[Line] "${line.region.text.substring(0, 50)}..." (confidence: ${(line.confidence * 100).toFixed(0)}%)`);
+
+    // Level 2: Detect phrase
+    const phrase = regionTracker!.detectPhrase(gaze.x, gaze.y, line.region);
+
+    if (phrase && phrase.confidence > 0.6) {
+      console.log(`[Phrase] "${phrase.region.text}" (confidence: ${(phrase.confidence * 100).toFixed(0)}%)`);
+
+      // Level 3: Word inference (experimental)
+      const wordRegion = regionTracker!.detectWord(gaze.x, gaze.y);
+
+      if (wordRegion && wordRegion.confidence > 0.5) {
+        console.log(`[Word] "${wordRegion.region.text}" (confidence: ${(wordRegion.confidence * 100).toFixed(0)}%)`);
+
+        // Highlight detected word
+        highlightElement(wordRegion.region.element, duration);
+
+        // Check if user is struggling (long fixation)
+        if (duration > 800) {
+          console.warn(`[Difficulty] User struggling with "${wordRegion.region.text}"`);
+          // TODO: Trigger AI assistance
+        }
+      }
+    }
+  }
+}
+
+// ========================================
+// UI COMPONENTS
+// ========================================
+
+function ensureOverlay(): void {
+  if (!overlayRoot) {
+    overlayRoot = document.createElement('div');
+    overlayRoot.id = 'rearead-overlay';
+    overlayRoot.style.cssText = `
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      z-index: 999999;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    `;
+    document.documentElement.appendChild(overlayRoot);
+  }
+
+  if (!statusBadge) {
+    statusBadge = document.createElement('div');
+    statusBadge.style.cssText = `
+      font-family: system-ui, sans-serif;
+      font-size: 12px;
+      color: #fff;
+      padding: 6px 10px;
+      border-radius: 999px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.2);
+      font-weight: 500;
+      background: rgba(107,114,128,.95);
+    `;
+    statusBadge.textContent = 'ReaRead • Initializing...';
+    overlayRoot.appendChild(statusBadge);
+  }
+
+  if (!videoEl) {
+    videoEl = document.createElement('video');
+    videoEl.autoplay = true;
+    videoEl.muted = true;
+    videoEl.playsInline = true;
+    videoEl.style.cssText = `
+      width: 160px;
+      height: 120px;
+      object-fit: cover;
+      border-radius: 12px;
+      box-shadow: 0 6px 18px rgba(0,0,0,.25);
+      pointer-events: none;
+    `;
+    overlayRoot.appendChild(videoEl);
+  }
+}
+
+function createGazeIndicator(): void {
+  if (gazeIndicator) return;
+
+  gazeIndicator = document.createElement('div');
+  gazeIndicator.style.cssText = `
+    position: fixed;
+    width: 16px;
+    height: 16px;
+    border: 2px solid #ef4444;
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 9999999;
+    transition: all 0.05s ease-out;
+    box-shadow: 0 0 15px rgba(239, 68, 68, 0.6);
+    display: none;
+  `;
+
+  document.body.appendChild(gazeIndicator);
+}
+
+let gazeIndicatorUpdateCount = 0;
+function updateGazeIndicator(x: number, y: number): void {
+  if (!gazeIndicator) {
+    console.warn('[ReaRead] updateGazeIndicator called but gazeIndicator is null');
+    return;
+  }
+
+  gazeIndicator.style.left = `${x - 8}px`;
+  gazeIndicator.style.top = `${y - 8}px`;
+  gazeIndicator.style.display = 'block';
+
+  // Debug: Log first update
+  gazeIndicatorUpdateCount++;
+  if (gazeIndicatorUpdateCount === 1) {
+    console.log('[ReaRead] ✅ Gaze indicator updated:', x.toFixed(0), y.toFixed(0));
+    console.log('[ReaRead] Indicator element:', gazeIndicator);
+    console.log('[ReaRead] Indicator styles:', gazeIndicator.style.cssText);
+  }
+}
+
+function createAnalyticsPanel(): void {
+  if (analyticsPanel) return;
+
+  analyticsPanel = document.createElement('div');
+  analyticsPanel.style.cssText = `
+    position: fixed;
+    bottom: 20px;
+    left: 20px;
+    width: 280px;
+    background: rgba(17, 24, 39, 0.95);
+    backdrop-filter: blur(10px);
+    border-radius: 12px;
+    padding: 16px;
+    color: white;
+    font-family: system-ui, sans-serif;
+    z-index: 9999998;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  `;
+
+  analyticsPanel.innerHTML = `
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+      <h3 style="margin: 0; font-size: 14px; font-weight: 600;">📊 Gaze Analytics</h3>
+      <button id="rearead-close-analytics" style="
+        background: rgba(239, 68, 68, 0.2);
+        border: none;
+        color: #ef4444;
+        border-radius: 6px;
+        padding: 3px 6px;
+        cursor: pointer;
+        font-size: 11px;
+      ">✕</button>
+    </div>
+
+    <div style="display: grid; gap: 8px;">
+      <div style="background: rgba(59, 130, 246, 0.1); border-radius: 6px; padding: 8px;">
+        <div style="font-size: 10px; color: #93c5fd; margin-bottom: 2px;">SESSION TIME</div>
+        <div id="session-time" style="font-size: 16px; font-weight: 700;">00:00</div>
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
+        <div style="background: rgba(16, 185, 129, 0.1); border-radius: 6px; padding: 8px;">
+          <div style="font-size: 9px; color: #6ee7b7; margin-bottom: 2px;">FIXATIONS</div>
+          <div id="total-fixations" style="font-size: 16px; font-weight: 700;">0</div>
+        </div>
+
+        <div style="background: rgba(251, 191, 36, 0.1); border-radius: 6px; padding: 8px;">
+          <div style="font-size: 9px; color: #fcd34d; margin-bottom: 2px;">SACCADES</div>
+          <div id="total-saccades" style="font-size: 16px; font-weight: 700;">0</div>
+        </div>
+      </div>
+
+      <div style="background: rgba(168, 85, 247, 0.1); border-radius: 6px; padding: 8px;">
+        <div style="font-size: 10px; color: #c4b5fd; margin-bottom: 2px;">REGION STATS</div>
+        <div id="region-stats" style="font-size: 12px; font-weight: 600;"></div>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(analyticsPanel);
+
+  const closeBtn = document.getElementById('rearead-close-analytics');
+  closeBtn?.addEventListener('click', () => {
+    analyticsPanel?.remove();
+    analyticsPanel = null;
+  });
+
+  setInterval(updateSessionTime, 1000);
+}
+
+function updateSessionTime(): void {
+  if (!sessionStartTime || !analyticsPanel) return;
+
+  const elapsed = Math.floor((Date.now() - sessionStartTime) / 1000);
+  const minutes = Math.floor(elapsed / 60);
+  const seconds = elapsed % 60;
+
+  const timeEl = document.getElementById('session-time');
+  if (timeEl) {
+    timeEl.textContent = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+}
+
+function updateAnalytics(): void {
+  if (!analyticsPanel) return;
+
+  const fixEl = document.getElementById('total-fixations');
+  if (fixEl) fixEl.textContent = String(totalFixations);
+
+  const sacEl = document.getElementById('total-saccades');
+  if (sacEl) sacEl.textContent = String(totalSaccades);
+
+  const statsEl = document.getElementById('region-stats');
+  if (statsEl && regionTracker) {
+    const stats = regionTracker.getStats();
+    statsEl.textContent = `${stats.lines} lines, ${stats.words} words`;
+  }
+}
+
+function highlightElement(element: HTMLElement, duration: number): void {
+  const intensity = Math.min(duration / 1000, 1);
+  const color = intensity > 0.7 ? 'rgba(239, 68, 68, 0.2)' :
+                intensity > 0.4 ? 'rgba(251, 191, 36, 0.2)' :
+                'rgba(34, 197, 94, 0.2)';
+
+  element.style.backgroundColor = color;
+  element.style.transition = 'background-color 0.3s ease';
+
+  setTimeout(() => {
+    element.style.backgroundColor = '';
+  }, 2000);
+}
+
+// ========================================
+// MESSAGE LISTENER
+// ========================================
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  console.log('[ReaRead] Message received:', msg?.type);
+
+  if (msg?.type === 'PING') {
+    sendResponse?.({ pong: true });
+    return true;
+  }
+
+  if (msg?.type === 'START_TRACKING') {
+    startCamera()
+      .then(() => sendResponse?.({ ok: true }))
+      .catch((err) => {
+        console.error('[ReaRead] Start error:', err);
+        sendResponse?.({ ok: false, error: err.message });
+      });
+    return true;
+  }
+
+  if (msg?.type === 'STOP_TRACKING') {
+    stopCamera();
+    sendResponse?.({ ok: true });
+    return true;
+  }
+
+  return false;
+});
+
+// ========================================
+// CLEANUP
+// ========================================
+
+window.addEventListener('beforeunload', () => {
+  if (isActive) stopCamera();
+});
+
+console.log('[ReaRead] 🚀 Content script loaded (MediaPipe Edition)');

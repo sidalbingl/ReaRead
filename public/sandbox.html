@@ -496,7 +496,7 @@
         frameCount++;
         const now = performance.now();
 
-        // Put image data on canvas
+        // Direkt imageData'yı canvas'a koy - mirror düzeltmesi MediaPipeTracker'da yapılıyor
         ctx.putImageData(imageData, 0, 0);
 
         const results = faceLandmarker.detectForVideo(canvas, now);
@@ -514,7 +514,7 @@
         if (results && results.faceLandmarks && results.faceLandmarks.length > 0) {
           const landmarks = results.faceLandmarks[0];
 
-          // Always use the reliable MediaPipe iris landmarks
+          // Orijinal landmark'ları gönder - mirror düzeltmesi MediaPipeTracker'da yapılacak
           const leftIris = {
             x: landmarks[468].x,
             y: landmarks[468].y
@@ -528,7 +528,7 @@
             log(`✅ Sending first GAZE_DATA: iris=(${leftIris.x.toFixed(2)}, ${leftIris.y.toFixed(2)})`);
           }
 
-          // Send raw, consistent data to parent
+          // Send raw data to parent
           window.parent.postMessage({
             type: 'GAZE_DATA',
             data: {

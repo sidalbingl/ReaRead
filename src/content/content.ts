@@ -87,7 +87,8 @@ async function runCalibration(): Promise<void> {
 
   const calibrationData: Array<{
     actual: { x: number; y: number },
-    measured: { x: number; y: number; normalizedX?: number; normalizedY?: number }
+    measured: { x: number; y: number; normalizedX?: number; normalizedY?: number },
+    stdDev?: number
   }> = [];
 
   await calibration.runCalibration(async (targetPoint) => {
@@ -121,7 +122,8 @@ async function runCalibration(): Promise<void> {
 
           calibrationData.push({
             actual: targetPoint,
-            measured: { x: avgX, y: avgY, normalizedX: avgNormX, normalizedY: avgNormY }
+            measured: { x: avgX, y: avgY, normalizedX: avgNormX, normalizedY: avgNormY },
+            stdDev
           });
 
           resolve({ x: avgX, y: avgY });
@@ -131,6 +133,7 @@ async function runCalibration(): Promise<void> {
   });
 
   // Apply calibration
+  console.log('[ReaRead] Applying calibration with data:', JSON.stringify(calibrationData, null, 2));
   tracker.applyCalibration(calibrationData);
   console.log('[ReaRead] ✅ Calibration complete');
 }

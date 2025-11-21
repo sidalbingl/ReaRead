@@ -29,18 +29,23 @@ export class MediaPipeTracker {
   private isRunning = false;
   private mediaStream: MediaStream | null = null;
 
-  // Linear calibration (least squares regression)
+  // Affine calibration matrix (2x3)
+  // [a, b, tx]   ->  x' = a*x + b*y + tx
+  // [c, d, ty]   ->  y' = c*x + d*y + ty
+  // This allows for rotation, scale, shear, and translation
   private calibrationMatrix: {
-    scaleX: number;
-    scaleY: number;
-    offsetX: number;
-    offsetY: number;
+    a: number;   // X scale + rotation
+    b: number;   // X shear
+    c: number;   // Y shear
+    d: number;   // Y scale + rotation
+    tx: number;  // X translation
+    ty: number;  // Y translation
   } = {
-    scaleX: 1.0,
-    scaleY: 1.0,
-    offsetX: 0,
-    offsetY: 0
+    a: 1, b: 0, tx: 0,
+    c: 0, d: 1, ty: 0
   };
+
+  private isCalibrated = false;
 
   // Smoothing filter - separate windows for X and Y
   private gazeHistory: Array<{ x: number; y: number }> = [];
@@ -169,16 +174,66 @@ export class MediaPipeTracker {
     const leftEyeCenterY = (leftEyeTop.y + leftEyeBottom.y) / 2;
     const rightEyeCenterY = (rightEyeTop.y + rightEyeBottom.y) / 2;
 
-    // Calculate iris offset from eye center
-    const leftIrisOffsetX = (leftIris.x - leftEyeCenterX) / (leftEyeWidth / 2);
-    const rightIrisOffsetX = (rightIris.x - rightEyeCenterX) / (rightEyeWidth / 2);
-    const leftIrisOffsetY = (leftIris.y - leftEyeCenterY) / (leftEyeHeight / 2);
-    const rightIrisOffsetY = (rightIris.y - rightEyeCenterY) / (rightEyeHeight / 2);
+    // Calculate iris offset from eye center (normalized by eye dimensions)
+    const leftIrisCenter = {
+      x: (leftIris.x - leftEyeCenterX) / (leftEyeWidth / 2),
+      y: (leftIris.y - leftEyeCenterY) / (leftEyeHeight / 2)
+    };
+    const rightIrisCenter = {
+      x: (rightIris.x - rightEyeCenterX) / (rightEyeWidth / 2),
+      y: (rightIris.y - rightEyeCenterY) / (rightEyeHeight / 2)
+    };
 
+    // Weighted average based on eye size (larger eye = more reliable)
+    const leftWeight = leftEyeWidth * leftEyeHeight;
+    const rightWeight = rightEyeWidth * rightEyeHeight;
+    const totalWeight = leftWeight + rightWeight;
 
-    // Average both eyes
-    const avgIrisOffsetX = (leftIrisOffsetX + rightIrisOffsetX) / 2;
-    const avgIrisOffsetY = (leftIrisOffsetY + rightIrisOffsetY) / 2;
+    // Raw iris offsets from both eyes
+    const irisOffsetX = (leftIrisCenter.x * leftWeight + rightIrisCenter.x * rightWeight) / totalWeight;
+    const irisOffsetY = (leftIrisCenter.y * leftWeight + rightIrisCenter.y * rightWeight) / totalWeight;
+
+    // Get face landmarks for head pose estimation
+    const noseTip = landmarks[4];        // Nose tip
+    const forehead = landmarks[10];      // Forehead center
+    const chin = landmarks[152];         // Chin
+    const leftCheek = landmarks[234];    // Left cheek
+    const rightCheek = landmarks[454];   // Right cheek
+
+    // HEAD YAW (left-right head rotation) for X-axis correction
+    // When head turns RIGHT, nose appears on LEFT side of face center
+    // Face center X = average of cheeks
+    const faceCenterX = (leftCheek.x + rightCheek.x) / 2;
+    const noseOffsetFromCenter = noseTip.x - faceCenterX;
+    // Normalize by face width
+    const faceWidth = Math.abs(rightCheek.x - leftCheek.x);
+    const headYaw = faceWidth > 0.01 ? (noseOffsetFromCenter / faceWidth) * 2 : 0; // Range ~ -1 to 1
+
+    // HEAD PITCH for Y-axis (up-down head tilt)
+    // Nose tip relative to forehead-chin line indicates pitch
+    const faceHeight = Math.abs(chin.y - forehead.y);
+    const nosePitchOffset = (noseTip.y - forehead.y) / faceHeight - 0.5;
+    const headPitch = nosePitchOffset * 2; // Range ~ -1 to 1
+
+    // === GAINS - Kimi AI önerisi: yaw=1.2, pitch=0.8 ===
+    const yawGain = 1.2;   // Yatayda tam telafi
+    const pitchGain = 0.8; // Dikeyde biraz daha az (NaN önler)
+
+    // Head pose katkısını hesapla ve CLAMP'le (taşmayı önle)
+    let dx = headYaw * yawGain;
+    let dy = headPitch * pitchGain;
+    dx = Math.max(-0.7, Math.min(0.7, dx));
+    dy = Math.max(-0.7, Math.min(0.7, dy));
+
+    // X-axis: Iris + head yaw (MIRROR: tersle)
+    let avgIrisOffsetX = -(irisOffsetX + dx);
+
+    // Y-axis: Iris + head pitch
+    let avgIrisOffsetY = -(irisOffsetY + dy);
+
+    // SON CLAMP: Normalized değerleri güvenli aralıkta tut
+    avgIrisOffsetX = Math.max(-0.95, Math.min(0.95, avgIrisOffsetX));
+    avgIrisOffsetY = Math.max(-0.95, Math.min(0.95, avgIrisOffsetY));
 
 
     // DEBUG: Log eye dimensions and offsets (first time only)
@@ -188,24 +243,35 @@ export class MediaPipeTracker {
         stableEyeHeight: this.stableEyeHeight.toFixed(4),
         aspectRatio: (this.stableEyeHeight / avgEyeWidth).toFixed(3)
       });
-      console.log('[MediaPipe] Using IRIS Y POSITION for Y-axis');
+      console.log('[MediaPipe] Using IRIS + HEAD_POSE for Y-axis');
     }
 
     // Map to normalized coordinates [-1, 1]
     const normalizedX = avgIrisOffsetX;
     const normalizedY = avgIrisOffsetY;
 
-    // Apply calibration on NORMALIZED coordinates: actual = scale * measured + offset
-    const calibratedX = normalizedX * this.calibrationMatrix.scaleX + this.calibrationMatrix.offsetX;
-    const calibratedY = normalizedY * this.calibrationMatrix.scaleY + this.calibrationMatrix.offsetY;
+    let gazeX: number;
+    let gazeY: number;
 
-    // Map to screen coordinates
-    const screenX = (calibratedX + 1) * 0.5 * sw; // [-1,1] -> [0, sw]
-    const screenY = (calibratedY + 1) * 0.5 * sh; // [-1,1] -> [0, sh]
+    if (!this.isCalibrated) {
+      // BEFORE CALIBRATION: Use simple linear mapping
+      // Iris offset typically ranges from -0.3 to 0.3
+      // Map this to screen coordinates with center at screen center
+      const irisRange = 0.4; // Expected range of iris movement
+      gazeX = sw / 2 + (normalizedX / irisRange) * (sw / 2);
+      gazeY = sh / 2 + (normalizedY / irisRange) * (sh / 2);
+    } else {
+      // AFTER CALIBRATION: Use affine transform
+      // x' = a*x + b*y + tx
+      // y' = c*x + d*y + ty
+      const { a, b, c, d, tx, ty } = this.calibrationMatrix;
+      gazeX = a * normalizedX + b * normalizedY + tx;
+      gazeY = c * normalizedX + d * normalizedY + ty;
+    }
 
-    // Clamp to screen bounds AFTER calibration
-    const gazeX = Math.max(0, Math.min(sw, screenX));
-    const gazeY = Math.max(0, Math.min(sh, screenY));
+    // Clamp to screen bounds
+    gazeX = Math.max(0, Math.min(sw, gazeX));
+    gazeY = Math.max(0, Math.min(sh, gazeY));
 
     // Apply separate smoothing for X and Y
     this.gazeHistory.push({ x: gazeX, y: gazeY });
@@ -221,12 +287,14 @@ export class MediaPipeTracker {
 
     // Debug log
     if (this.frameCounter === 1 || this.frameCounter % 100 === 0) {
-      console.log(`[MediaPipe] Frame ${this.frameCounter}:`);
+      console.log(`[MediaPipe] Frame ${this.frameCounter} (calibrated=${this.isCalibrated}):`);
       console.log(`  iris=(${avgIrisOffsetX.toFixed(3)}, ${avgIrisOffsetY.toFixed(3)})`);
       console.log(`  normalized=(${normalizedX.toFixed(3)}, ${normalizedY.toFixed(3)})`);
-      console.log(`  calibrated=(${calibratedX.toFixed(3)}, ${calibratedY.toFixed(3)})`);
-      console.log(`  screen=(${screenX.toFixed(0)}, ${screenY.toFixed(0)})`);
-      console.log(`  calibration: scale=(${this.calibrationMatrix.scaleX.toFixed(2)}, ${this.calibrationMatrix.scaleY.toFixed(2)}), offset=(${this.calibrationMatrix.offsetX.toFixed(2)}, ${this.calibrationMatrix.offsetY.toFixed(2)})`);
+      console.log(`  raw gaze=(${gazeX.toFixed(0)}, ${gazeY.toFixed(0)})`);
+      if (this.isCalibrated) {
+        const { a, b, c, d, tx, ty } = this.calibrationMatrix;
+        console.log(`  affine: [${a.toFixed(1)}, ${b.toFixed(1)}, ${tx.toFixed(0)}] [${c.toFixed(1)}, ${d.toFixed(1)}, ${ty.toFixed(0)}]`);
+      }
       console.log(`  final gaze=(${smoothedX.toFixed(0)}, ${smoothedY.toFixed(0)})`);
     }
 
@@ -248,123 +316,228 @@ export class MediaPipeTracker {
   }
 
   /**
-   * Apply calibration data
-   * Uses linear regression on NORMALIZED coordinates: actual_norm = scale * measured_norm + offset
-   *
-   * @param points - Array where:
-   *   - actual: target screen coordinates (pixels)
-   *   - measured: can be either screen pixels OR normalized coords
-   *     If measured has normalizedX/normalizedY, use those
-   *     Otherwise convert screen coords to normalized
+   * Apply calibration using Affine Transform (2x3 matrix)
+   * Solves for: [a, b, tx; c, d, ty] where
+   *   x' = a*x + b*y + tx
+   *   y' = c*x + d*y + ty
+   * Uses least squares to fit all calibration points
    */
   applyCalibration(points: Array<{
     actual: { x: number; y: number },
-    measured: { x: number; y: number; normalizedX?: number; normalizedY?: number }
+    measured: { x: number; y: number; normalizedX?: number; normalizedY?: number },
+    stdDev?: number
   }>): void {
     if (points.length === 0) return;
 
-    console.log('[MediaPipe] Applying calibration with', points.length, 'points');
+    console.log('[MediaPipe] Applying affine calibration with', points.length, 'points');
+
+    // OUTLIER FILTERING: Remove points with high stdDev (> 50px)
+    // Gevşetildi: 25 -> 50 (daha fazla nokta geçsin)
+    const MAX_STDDEV = 50;
+    const goodPoints = points.filter(p => {
+      const isGood = !p.stdDev || p.stdDev < MAX_STDDEV;
+      if (!isGood) {
+        console.log(`[MediaPipe] Filtering out point (${p.actual.x.toFixed(0)}, ${p.actual.y.toFixed(0)}) with stdDev=${p.stdDev?.toFixed(0)}px`);
+      }
+      return isGood;
+    });
+
+    console.log(`[MediaPipe] ${goodPoints.length}/${points.length} points passed quality filter`);
+
+    // Require at least 4 good points for affine transform (3 minimum, 4 for stability)
+    if (goodPoints.length < 4) {
+      console.warn(`[MediaPipe] Not enough good calibration points (${goodPoints.length}/4), using default matrix`);
+      this.useDefaultCalibration();
+      return;
+    }
 
     const sw = window.innerWidth;
     const sh = window.innerHeight;
 
-    // Convert all points to normalized coordinates [-1, 1]
-    const normalizedPoints = points.map(p => ({
-      actual: {
-        x: (p.actual.x / sw) * 2 - 1,    // [0, sw] -> [-1, 1]
-        y: (p.actual.y / sh) * 2 - 1     // [0, sh] -> [-1, 1]
-      },
-      measured: {
-        // Use raw normalized if available, otherwise convert screen to normalized
-        x: p.measured.normalizedX !== undefined ? p.measured.normalizedX : (p.measured.x / sw) * 2 - 1,
-        y: p.measured.normalizedY !== undefined ? p.measured.normalizedY : (p.measured.y / sh) * 2 - 1
-      }
+    // Prepare data: measured (iris) -> actual (screen pixels)
+    const data = goodPoints.map(p => ({
+      // Source: normalized iris position
+      srcX: p.measured.normalizedX !== undefined ? p.measured.normalizedX : 0,
+      srcY: p.measured.normalizedY !== undefined ? p.measured.normalizedY : 0,
+      // Destination: actual screen position (pixels)
+      dstX: p.actual.x,
+      dstY: p.actual.y
     }));
 
-    // DEBUG: Log sample calibration points
-    console.log('[MediaPipe] Sample calibration points (normalized):');
-    for (let i = 0; i < Math.min(5, normalizedPoints.length); i++) {
-      const p = normalizedPoints[i];
-      console.log(`  Point ${i+1}: actual=(${p.actual.x.toFixed(3)}, ${p.actual.y.toFixed(3)}) measured=(${p.measured.x.toFixed(3)}, ${p.measured.y.toFixed(3)})`);
+    // DEBUG: Log calibration points
+    console.log('[MediaPipe] Calibration points:');
+    data.forEach((p, i) => {
+      console.log(`  Point ${i+1}: src=(${p.srcX.toFixed(3)}, ${p.srcY.toFixed(3)}) -> dst=(${p.dstX.toFixed(0)}, ${p.dstY.toFixed(0)})`);
+    });
+
+    // Solve affine transform using least squares
+    // For X: dstX = a*srcX + b*srcY + tx
+    // For Y: dstY = c*srcX + d*srcY + ty
+    //
+    // Using normal equations: A^T * A * params = A^T * b
+    // where A = [[srcX1, srcY1, 1], [srcX2, srcY2, 1], ...]
+    //       b = [dstX1, dstX2, ...] or [dstY1, dstY2, ...]
+
+    const n = data.length;
+
+    // Build matrices for least squares
+    let sumX = 0, sumY = 0;
+    let sumXX = 0, sumYY = 0, sumXY = 0;
+    let sumDstX = 0, sumDstY = 0;
+    let sumXDstX = 0, sumYDstX = 0;
+    let sumXDstY = 0, sumYDstY = 0;
+
+    data.forEach(p => {
+      sumX += p.srcX;
+      sumY += p.srcY;
+      sumXX += p.srcX * p.srcX;
+      sumYY += p.srcY * p.srcY;
+      sumXY += p.srcX * p.srcY;
+      sumDstX += p.dstX;
+      sumDstY += p.dstY;
+      sumXDstX += p.srcX * p.dstX;
+      sumYDstX += p.srcY * p.dstX;
+      sumXDstY += p.srcX * p.dstY;
+      sumYDstY += p.srcY * p.dstY;
+    });
+
+    // Solve 3x3 system for X: [sumXX, sumXY, sumX; sumXY, sumYY, sumY; sumX, sumY, n] * [a; b; tx] = [sumXDstX; sumYDstX; sumDstX]
+    // Using Cramer's rule for simplicity
+
+    const detA = sumXX * (sumYY * n - sumY * sumY)
+               - sumXY * (sumXY * n - sumY * sumX)
+               + sumX * (sumXY * sumY - sumYY * sumX);
+
+    if (Math.abs(detA) < 1e-10) {
+      console.warn('[MediaPipe] Singular matrix in calibration, using default');
+      this.useDefaultCalibration();
+      return;
     }
 
-    // Calculate means
-    let meanActualX = 0, meanActualY = 0;
-    let meanMeasuredX = 0, meanMeasuredY = 0;
+    // Solve for a, b, tx (X equation)
+    const detAa = sumXDstX * (sumYY * n - sumY * sumY)
+                - sumXY * (sumYDstX * n - sumY * sumDstX)
+                + sumX * (sumYDstX * sumY - sumYY * sumDstX);
 
-    normalizedPoints.forEach(p => {
-      meanActualX += p.actual.x;
-      meanActualY += p.actual.y;
-      meanMeasuredX += p.measured.x;
-      meanMeasuredY += p.measured.y;
-    });
+    const detAb = sumXX * (sumYDstX * n - sumY * sumDstX)
+                - sumXDstX * (sumXY * n - sumY * sumX)
+                + sumX * (sumXY * sumDstX - sumYDstX * sumX);
 
-    meanActualX /= normalizedPoints.length;
-    meanActualY /= normalizedPoints.length;
-    meanMeasuredX /= normalizedPoints.length;
-    meanMeasuredY /= normalizedPoints.length;
+    const detAtx = sumXX * (sumYY * sumDstX - sumYDstX * sumY)
+                 - sumXY * (sumXY * sumDstX - sumYDstX * sumX)
+                 + sumXDstX * (sumXY * sumY - sumYY * sumX);
 
-    // Calculate scale using least squares regression
-    let numeratorX = 0, denominatorX = 0;
-    let numeratorY = 0, denominatorY = 0;
+    const a = detAa / detA;
+    const b = detAb / detA;
+    const tx = detAtx / detA;
 
-    normalizedPoints.forEach(p => {
-      const dx = p.measured.x - meanMeasuredX;
-      const dy = p.measured.y - meanMeasuredY;
+    // Solve for c, d, ty (Y equation) - same matrix, different RHS
+    const detAc = sumXDstY * (sumYY * n - sumY * sumY)
+                - sumXY * (sumYDstY * n - sumY * sumDstY)
+                + sumX * (sumYDstY * sumY - sumYY * sumDstY);
 
-      numeratorX += dx * (p.actual.x - meanActualX);
-      denominatorX += dx * dx;
+    const detAd = sumXX * (sumYDstY * n - sumY * sumDstY)
+                - sumXDstY * (sumXY * n - sumY * sumX)
+                + sumX * (sumXY * sumDstY - sumYDstY * sumX);
 
-      numeratorY += dy * (p.actual.y - meanActualY);
-      denominatorY += dy * dy;
-    });
+    const detAty = sumXX * (sumYY * sumDstY - sumYDstY * sumY)
+                 - sumXY * (sumXY * sumDstY - sumYDstY * sumX)
+                 + sumXDstY * (sumXY * sumY - sumYY * sumX);
 
-    const scaleX = denominatorX !== 0 ? numeratorX / denominatorX : 1.0;
-    const scaleY = denominatorY !== 0 ? numeratorY / denominatorY : 1.0;
+    const c = detAc / detA;
+    const d = detAd / detA;
+    const ty = detAty / detA;
 
-    // Calculate offset: offset = mean(actual) - scale * mean(measured)
-    const offsetX = meanActualX - scaleX * meanMeasuredX;
-    const offsetY = meanActualY - scaleY * meanMeasuredY;
+    console.log(`[MediaPipe] Raw affine: a=${a.toFixed(1)}, b=${b.toFixed(1)}, tx=${tx.toFixed(0)}`);
+    console.log(`[MediaPipe] Raw affine: c=${c.toFixed(1)}, d=${d.toFixed(1)}, ty=${ty.toFixed(0)}`);
 
-    this.calibrationMatrix = {
-      scaleX,
-      scaleY,
-      offsetX,
-      offsetY
-    };
+    // SANITY CHECK: Normalized scale values should be reasonable
+    // After mirror fix and head-pose, normalized range should be ~0.6-0.8
+    // So scale to fill screen should be ~1.5-2.5x, max 3x
+    // Scale in pixels = (screen_size / normalized_range)
+    // For sw=1536 and normalized_range=0.6: scale ≈ 2560
+    const expectedScale = sw / 0.6;  // Expected scale for typical iris range
+    const MAX_SCALE = expectedScale * 3;  // Allow 3x expected
+    const MIN_SCALE = expectedScale / 5;  // Allow 0.2x expected
 
-    // Calculate calibration quality in SCREEN coordinates for readability
+    const scaleX = Math.sqrt(a * a + c * c);  // Effective X scale
+    const primaryScaleY = Math.abs(d);        // Primary Y scale
+
+    console.log(`[MediaPipe] Effective scales: X=${scaleX.toFixed(0)}, Y=${primaryScaleY.toFixed(0)} (expected ~${expectedScale.toFixed(0)})`);
+
+    if (scaleX > MAX_SCALE || scaleX < MIN_SCALE) {
+      console.warn(`[MediaPipe] ScaleX ${scaleX.toFixed(0)} out of valid range [${MIN_SCALE.toFixed(0)}, ${MAX_SCALE.toFixed(0)}], using default`);
+      this.useDefaultCalibration();
+      return;
+    }
+    if (primaryScaleY > MAX_SCALE || primaryScaleY < MIN_SCALE) {
+      console.warn(`[MediaPipe] ScaleY ${primaryScaleY.toFixed(0)} out of valid range [${MIN_SCALE.toFixed(0)}, ${MAX_SCALE.toFixed(0)}], using default`);
+      this.useDefaultCalibration();
+      return;
+    }
+
+    // Apply the calibration
+    this.calibrationMatrix = { a, b, c, d, tx, ty };
+    this.isCalibrated = true;
+
+    // Calculate calibration quality
     let totalErrorBefore = 0;
     let totalErrorAfter = 0;
 
-    points.forEach((p, i) => {
-      const pNorm = normalizedPoints[i];
-
-      // Before (in screen px)
-      const dxBefore = p.actual.x - p.measured.x;
-      const dyBefore = p.actual.y - p.measured.y;
+    data.forEach(p => {
+      // Before: simple center mapping
+      const beforeX = sw / 2 + p.srcX * sw;
+      const beforeY = sh / 2 + p.srcY * sh;
+      const dxBefore = p.dstX - beforeX;
+      const dyBefore = p.dstY - beforeY;
       totalErrorBefore += Math.sqrt(dxBefore * dxBefore + dyBefore * dyBefore);
 
-      // After: apply calibration in normalized space, then convert to screen
-      const correctedNormX = scaleX * pNorm.measured.x + offsetX;
-      const correctedNormY = scaleY * pNorm.measured.y + offsetY;
-      const correctedX = (correctedNormX + 1) * 0.5 * sw;
-      const correctedY = (correctedNormY + 1) * 0.5 * sh;
-
-      const dxAfter = p.actual.x - correctedX;
-      const dyAfter = p.actual.y - correctedY;
+      // After: apply affine
+      const afterX = a * p.srcX + b * p.srcY + tx;
+      const afterY = c * p.srcX + d * p.srcY + ty;
+      const dxAfter = p.dstX - afterX;
+      const dyAfter = p.dstY - afterY;
       totalErrorAfter += Math.sqrt(dxAfter * dxAfter + dyAfter * dyAfter);
     });
 
-    const avgErrorBefore = totalErrorBefore / points.length;
-    const avgErrorAfter = totalErrorAfter / points.length;
+    const avgErrorBefore = totalErrorBefore / n;
+    const avgErrorAfter = totalErrorAfter / n;
 
-    console.log('[MediaPipe] ✅ Calibration applied:');
-    console.log(`  Scale: (${scaleX.toFixed(3)}, ${scaleY.toFixed(3)})`);
-    console.log(`  Offset: (${offsetX.toFixed(3)}, ${offsetY.toFixed(3)})`);
+    console.log('[MediaPipe] ✅ Affine calibration applied:');
+    console.log(`  Matrix: [${a.toFixed(1)}, ${b.toFixed(1)}, ${tx.toFixed(0)}]`);
+    console.log(`          [${c.toFixed(1)}, ${d.toFixed(1)}, ${ty.toFixed(0)}]`);
     console.log(`  Avg error BEFORE: ${avgErrorBefore.toFixed(0)}px`);
     console.log(`  Avg error AFTER: ${avgErrorAfter.toFixed(0)}px`);
     console.log(`  Improvement: ${((avgErrorBefore - avgErrorAfter) / avgErrorBefore * 100).toFixed(1)}%`);
+  }
+
+  /**
+   * Use default calibration matrix when quality is too low
+   * This provides a reasonable baseline that maps iris position to screen
+   */
+  private useDefaultCalibration(): void {
+    const sw = window.innerWidth;
+    const sh = window.innerHeight;
+
+    // Default affine: simple scale + center offset
+    // Iris range ~0.6 should map to full screen
+    // x' = a*x + b*y + tx  ->  x' = (sw/0.6)*x + 0*y + sw/2
+    // y' = c*x + d*y + ty  ->  y' = 0*x + (sh/0.6)*y + sh/2
+    const irisRange = 0.6;
+
+    this.calibrationMatrix = {
+      a: sw / irisRange,  // X scale
+      b: 0,               // No X-Y coupling
+      c: 0,               // No Y-X coupling
+      d: sh / irisRange,  // Y scale
+      tx: sw / 2,         // X center
+      ty: sh / 2          // Y center
+    };
+
+    this.isCalibrated = true;
+    console.log('[MediaPipe] Using default affine calibration');
+    console.log(`  Matrix: [${this.calibrationMatrix.a.toFixed(0)}, 0, ${this.calibrationMatrix.tx.toFixed(0)}]`);
+    console.log(`          [0, ${this.calibrationMatrix.d.toFixed(0)}, ${this.calibrationMatrix.ty.toFixed(0)}]`);
   }
 
   async dispose(): Promise<void> {

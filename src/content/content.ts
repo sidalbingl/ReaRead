@@ -4,7 +4,7 @@
  * Clean, simple eye tracking
  */
 
-import { MediaPipeTracker, GazePoint } from '../eye/MediaPipeTracker';
+import { MediaPipeTracker, GazePoint, HeadPose } from '../eye/MediaPipeTracker';
 import { CalibrationSystem } from '../eye/CalibrationSystem';
 
 // ========================================
@@ -57,6 +57,7 @@ async function startCamera(): Promise<void> {
     tracker = new MediaPipeTracker({
       videoElement: videoEl,
       onGazeUpdate: handleGazeUpdate,
+      onHeadPoseUpdate: handleHeadPoseUpdate,
       onError: (error) => console.error('[ReaRead] Error:', error)
     });
 
@@ -93,9 +94,12 @@ async function runCalibration(): Promise<void> {
 
   await calibration.runCalibration(async (targetPoint) => {
     // Collect gaze samples - INCREASED for better accuracy
+    // Wait a bit before collecting to let user's gaze stabilize
+    await new Promise(r => setTimeout(r, 300));
+
     return new Promise((resolve) => {
       const samples: GazePoint[] = [];
-      const sampleCount = 30; // Increased from 20 to 30
+      const sampleCount = 50; // Increased from 30 to 50 for better averaging
 
       const interval = setInterval(() => {
         if (currentGaze) {
@@ -105,20 +109,33 @@ async function runCalibration(): Promise<void> {
         if (samples.length >= sampleCount) {
           clearInterval(interval);
 
+          // Remove outliers (top/bottom 10%)
+          const sortedX = [...samples].sort((a, b) => a.x - b.x);
+          const sortedY = [...samples].sort((a, b) => a.y - b.y);
+          const trimCount = Math.floor(sampleCount * 0.1);
+          const trimmedSamples = samples.filter((_, i) => {
+            const xRank = sortedX.indexOf(samples[i]);
+            const yRank = sortedY.indexOf(samples[i]);
+            return xRank >= trimCount && xRank < sampleCount - trimCount &&
+                   yRank >= trimCount && yRank < sampleCount - trimCount;
+          });
+
+          const validSamples = trimmedSamples.length >= 10 ? trimmedSamples : samples;
+
           // Average samples (screen coordinates)
-          const avgX = samples.reduce((sum, g) => sum + g.x, 0) / samples.length;
-          const avgY = samples.reduce((sum, g) => sum + g.y, 0) / samples.length;
+          const avgX = validSamples.reduce((sum, g) => sum + g.x, 0) / validSamples.length;
+          const avgY = validSamples.reduce((sum, g) => sum + g.y, 0) / validSamples.length;
 
           // Average RAW normalized coordinates (before calibration)
-          const avgNormX = samples.reduce((sum, g) => sum + (g.normalizedX || 0), 0) / samples.length;
-          const avgNormY = samples.reduce((sum, g) => sum + (g.normalizedY || 0), 0) / samples.length;
+          const avgNormX = validSamples.reduce((sum, g) => sum + (g.normalizedX || 0), 0) / validSamples.length;
+          const avgNormY = validSamples.reduce((sum, g) => sum + (g.normalizedY || 0), 0) / validSamples.length;
 
           // Calculate variance to check stability
-          const varX = samples.reduce((sum, g) => sum + Math.pow(g.x - avgX, 2), 0) / samples.length;
-          const varY = samples.reduce((sum, g) => sum + Math.pow(g.y - avgY, 2), 0) / samples.length;
+          const varX = validSamples.reduce((sum, g) => sum + Math.pow(g.x - avgX, 2), 0) / validSamples.length;
+          const varY = validSamples.reduce((sum, g) => sum + Math.pow(g.y - avgY, 2), 0) / validSamples.length;
           const stdDev = Math.sqrt(varX + varY);
 
-          console.log(`[Calibration] Point: actual=(${targetPoint.x.toFixed(0)}, ${targetPoint.y.toFixed(0)}), measured=(${avgX.toFixed(0)}, ${avgY.toFixed(0)}), normalized=(${avgNormX.toFixed(3)}, ${avgNormY.toFixed(3)}), stdDev=${stdDev.toFixed(0)}px`);
+          console.log(`[Calibration] Point: actual=(${targetPoint.x.toFixed(0)}, ${targetPoint.y.toFixed(0)}), measured=(${avgX.toFixed(0)}, ${avgY.toFixed(0)}), normalized=(${avgNormX.toFixed(3)}, ${avgNormY.toFixed(3)}), stdDev=${stdDev.toFixed(0)}px, samples=${validSamples.length}/${sampleCount}`);
 
           calibrationData.push({
             actual: targetPoint,
@@ -128,7 +145,7 @@ async function runCalibration(): Promise<void> {
 
           resolve({ x: avgX, y: avgY });
         }
-      }, 50);
+      }, 40); // Slightly faster sampling (25fps)
     });
   });
 
@@ -157,15 +174,75 @@ function stopCamera(): void {
 }
 
 // ========================================
-// GAZE HANDLING
+// GAZE HANDLING - Satır Bazlı Stabilizasyon
 // ========================================
+
+// Kimi AI önerileri v2:
+// 1. Frame skip → 30 FPS → 15 FPS (feedback loop kırılır)
+// 2. Low-pass α = 0.15 → daha agresif (6-7 frame ortalama)
+// 3. Satır yüksekliği bazlı dead-zone (Y: 16px, X: 20px)
+// 4. Cursor her zaman görünsün ama sabit kalsın
+
+const SMOOTHING_ALPHA = 0.15;  // Çok agresif smoothing
+const LINE_HEIGHT = 16;        // Tipik satır yüksekliği
+const DEAD_ZONE_Y = LINE_HEIGHT * 0.5; // ±8px dikey (yarım satır)
+const DEAD_ZONE_X = 20;        // ±20px yatay
+
+let smoothedX = 0;
+let smoothedY = 0;
+let displayX = 0;
+let displayY = 0;
+let isFirstGaze = true;
+let frameSkip = 0;
+
+// Head pose handler for calibration monitoring
+function handleHeadPoseUpdate(pose: HeadPose): void {
+  if (calibration) {
+    calibration.updateHeadPose({
+      yaw: pose.yaw,
+      pitch: pose.pitch,
+      x: pose.x,
+      y: pose.y
+    });
+  }
+}
 
 function handleGazeUpdate(gaze: GazePoint): void {
   currentGaze = gaze;
 
+  // A. Frame skip - her 2. frame'i atla (30 FPS → 15 FPS)
+  frameSkip = (frameSkip + 1) % 2;
+  if (frameSkip !== 0) return;
+
+  // İlk frame'de başlangıç değerlerini ayarla
+  if (isFirstGaze) {
+    smoothedX = gaze.x;
+    smoothedY = gaze.y;
+    displayX = gaze.x;
+    displayY = gaze.y;
+    isFirstGaze = false;
+  }
+
+  // B. Low-pass filter - α=0.15 (çok yavaş tepki, titreme yok)
+  smoothedX = SMOOTHING_ALPHA * gaze.x + (1 - SMOOTHING_ALPHA) * smoothedX;
+  smoothedY = SMOOTHING_ALPHA * gaze.y + (1 - SMOOTHING_ALPHA) * smoothedY;
+
+  // C. Dead-zone - satır içinde kaldığı sürece hareket etme
+  // X: Yatayda ±20px içinde sabit kal
+  if (Math.abs(smoothedX - displayX) > DEAD_ZONE_X) {
+    displayX = smoothedX;
+  }
+
+  // Y: Dikeyde ±8px (yarım satır) içinde sabit kal
+  if (Math.abs(smoothedY - displayY) > DEAD_ZONE_Y) {
+    displayY = smoothedY;
+  }
+
+  // D. Cursor'u güncelle - her zaman görünsün
   if (gazeIndicator) {
-    gazeIndicator.style.left = `${gaze.x - 8}px`;
-    gazeIndicator.style.top = `${gaze.y - 8}px`;
+    gazeIndicator.style.left = `${displayX - 8}px`;
+    gazeIndicator.style.top = `${displayY - 8}px`;
+    gazeIndicator.style.opacity = '0.8';  // Her zaman görünür
     gazeIndicator.style.display = 'block';
   }
 }
@@ -231,6 +308,7 @@ function createGazeIndicator(): void {
     z-index: 9999999;
     box-shadow: 0 0 10px rgba(239, 68, 68, 0.5);
     display: none;
+    transition: opacity 0.2s ease-out, left 0.1s ease-out, top 0.1s ease-out;
   `;
   document.body.appendChild(gazeIndicator);
 }

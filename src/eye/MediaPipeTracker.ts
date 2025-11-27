@@ -17,8 +17,16 @@ export interface GazePoint {
   normalizedY?: number;  // [-1, 1] range
 }
 
+export interface HeadPose {
+  yaw: number;   // Left-right head rotation
+  pitch: number; // Up-down head rotation
+  x: number;     // Nose X position (0-1)
+  y: number;     // Nose Y position (0-1)
+}
+
 export interface MediaPipeConfig {
   onGazeUpdate?: (gaze: GazePoint) => void;
+  onHeadPoseUpdate?: (pose: HeadPose) => void;
   onError?: (error: Error) => void;
   videoElement: HTMLVideoElement;
 }
@@ -215,21 +223,33 @@ export class MediaPipeTracker {
     const nosePitchOffset = (noseTip.y - forehead.y) / faceHeight - 0.5;
     const headPitch = nosePitchOffset * 2; // Range ~ -1 to 1
 
-    // === GAINS - Kimi AI önerisi: yaw=1.2, pitch=0.8 ===
-    const yawGain = 1.2;   // Yatayda tam telafi
-    const pitchGain = 0.8; // Dikeyde biraz daha az (NaN önler)
+    // === REDUCED HEAD POSE COMPENSATION ===
+    // Previous gains (1.2, 0.8) were causing iris range to collapse
+    // Reducing to let calibration matrix handle the compensation
+    const yawGain = 0.3;   // Reduced from 1.2 - let calibration handle most of it
+    const pitchGain = 0.2; // Reduced from 0.8 - let calibration handle most of it
 
     // Head pose katkısını hesapla ve CLAMP'le (taşmayı önle)
     let dx = headYaw * yawGain;
     let dy = headPitch * pitchGain;
-    dx = Math.max(-0.7, Math.min(0.7, dx));
-    dy = Math.max(-0.7, Math.min(0.7, dy));
+    dx = Math.max(-0.3, Math.min(0.3, dx));
+    dy = Math.max(-0.3, Math.min(0.3, dy));
 
     // X-axis: Iris + head yaw (MIRROR: tersle)
     let avgIrisOffsetX = -(irisOffsetX + dx);
 
     // Y-axis: Iris + head pitch
     let avgIrisOffsetY = -(irisOffsetY + dy);
+
+    // Send head pose update for calibration monitoring
+    if (this.config.onHeadPoseUpdate) {
+      this.config.onHeadPoseUpdate({
+        yaw: headYaw,
+        pitch: headPitch,
+        x: noseTip.x,
+        y: noseTip.y
+      });
+    }
 
     // SON CLAMP: Normalized değerleri güvenli aralıkta tut
     avgIrisOffsetX = Math.max(-0.95, Math.min(0.95, avgIrisOffsetX));
